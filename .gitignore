@@ -1,0 +1,9 @@
+# Runtime artifacts
+smoke.log
+*.db
+*.db-wal
+*.db-shm
+
+# Local-only
+__pycache__/
+*.pyc
