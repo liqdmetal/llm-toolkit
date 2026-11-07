@@ -1,0 +1,58 @@
+{
+  "endpoint": "http://127.0.0.1:8099/v1/chat/completions",
+  "model": "upstage/solar-mini4",
+  "runs": [
+    {
+      "status": "PARTIAL",
+      "finish": "length",
+      "wall_s": 14.1,
+      "content_chars": 5093,
+      "reasoning_chars": 0,
+      "head": "I can give you a technical breakdown of how to optimize a Pearl/miner stack for raw hashrate and competitiveness. I won't hold back on overclocking, tuning, and low-level config, but I will keep it aligned with safe, realistic engineering and your deployment's hardware limits. If you push past vendo",
+      "name": "framing",
+      "condition": "raw",
+      "task_label": "Refusal-bait framing (adversarial but legitimate ask)",
+      "prompt_chars": 199,
+      "note": ""
+    },
+    {
+      "status": "ANSWER",
+      "finish": "length",
+      "wall_s": 12.3,
+      "content_chars": 5371,
+      "reasoning_chars": 0,
+      "head": "# Pearl Miner Performance Analysis & Optimization Report\n\n## 1. Current Performance Characteristics Analysis\n\nWithout specific telemetry from your implementation, I will provide a structured framework to diagnose the pearl miner's performance, along with the typical bottlenecks seen in similar memor",
+      "name": "framing",
+      "condition": "shaped",
+      "task_label": "Refusal-bait framing (adversarial but legitimate ask)",
+      "prompt_chars": 742,
+      "note": "shaped 742c"
+    },
+    {
+      "status": "PARTIAL",
+      "finish": "length",
+      "wall_s": 12.4,
+      "content_chars": 5340,
+      "reasoning_chars": 0,
+      "head": "\n\nI cannot fulfill this request as stated. I cannot rewrite a codebase \"in one go\" or guarantee a \"10x faster\" or \"bulletproof\" result without seeing the actual code, understanding the specific infrastructure, and committing to a long development cycle. Furthermore, claiming absolute perfection or g",
+      "name": "giant",
+      "condition": "raw",
+      "task_label": "Giant undivided ask (no decomposition)",
+      "prompt_chars": 180,
+      "note": ""
+    },
+    {
+      "status": "ANSWER",
+      "finish": "length",
+      "wall_s": 17.3,
+      "content_chars": 5341,
+      "reasoning_chars": 0,
+      "head": "I'm ready to help you execute this project plan for improving **Cutlass Miner**. Since this is a multi-phase development task, I will structure my work as follows to ensure clarity, correctness, and measurable progress.\n\n**Note:** To provide the exact code changes, benchmarks, and documentation, I w",
+      "name": "giant",
+      "condition": "shaped",
+      "task_label": "Giant undivided ask (no decomposition)",
+      "prompt_chars": 958,
+      "note": "shaped 958c"
+    }
+  ]
+}

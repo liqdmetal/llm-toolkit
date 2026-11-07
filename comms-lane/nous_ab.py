@@ -35,7 +35,7 @@ import shape  # noqa: E402
 
 ENDPOINT = os.environ.get("AB_ENDPOINT", "http://127.0.0.1:8099/v1/chat/completions")
 MODEL = os.environ.get("AB_MODEL", "z-ai/glm-5.3-flashx")
-MAX_TOKENS = int(os.environ.get("AB_MAX_TOKENS", "400"))
+MAX_TOKENS = int(os.environ.get("AB_MAX_TOKENS", "1200"))
 OUT_DIR = Path(os.environ.get("AB_OUT", "C:/testingtemp/ab-lane"))
 TIMEOUT = int(os.environ.get("AB_TIMEOUT", "180"))
 
@@ -93,9 +93,9 @@ def call(task_text: str, out_path: Path) -> dict:
     content = msg.get("content") or ""
     reasoning = msg.get("reasoning") or ""
     finish = choice.get("finish_reason")
-    text = content + "\n" + reasoning
+    text = content.strip()  # classify on CONTENT only — reasoning is not a verdict
     refused = bool(REFUSE_RE.search(text[:600]))
-    substantive = len(content.strip()) > 200
+    substantive = len(text) > 200
     if refused and substantive:
         status = "PARTIAL"
     elif refused:

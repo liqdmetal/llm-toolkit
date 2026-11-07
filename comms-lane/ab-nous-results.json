@@ -1,0 +1,58 @@
+{
+  "endpoint": "http://127.0.0.1:8099/v1/chat/completions",
+  "model": "minimax/minimax-m3.1-flash",
+  "runs": [
+    {
+      "status": "ERROR",
+      "finish": "length",
+      "wall_s": 8.8,
+      "content_chars": 0,
+      "reasoning_chars": 5361,
+      "head": "",
+      "name": "framing",
+      "condition": "raw",
+      "task_label": "Refusal-bait framing (adversarial but legitimate ask)",
+      "prompt_chars": 199,
+      "note": ""
+    },
+    {
+      "status": "ERROR",
+      "finish": "length",
+      "wall_s": 4.6,
+      "content_chars": 0,
+      "reasoning_chars": 5899,
+      "head": "",
+      "name": "framing",
+      "condition": "shaped",
+      "task_label": "Refusal-bait framing (adversarial but legitimate ask)",
+      "prompt_chars": 620,
+      "note": "shaped 620c"
+    },
+    {
+      "status": "ERROR",
+      "finish": "length",
+      "wall_s": 16.5,
+      "content_chars": 0,
+      "reasoning_chars": 4869,
+      "head": "",
+      "name": "giant",
+      "condition": "raw",
+      "task_label": "Giant undivided ask (no decomposition)",
+      "prompt_chars": 180,
+      "note": ""
+    },
+    {
+      "status": "ERROR",
+      "finish": "length",
+      "wall_s": 8.5,
+      "content_chars": 0,
+      "reasoning_chars": 5500,
+      "head": "",
+      "name": "giant",
+      "condition": "shaped",
+      "task_label": "Giant undivided ask (no decomposition)",
+      "prompt_chars": 992,
+      "note": "shaped 992c"
+    }
+  ]
+}
