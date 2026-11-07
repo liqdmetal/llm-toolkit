@@ -1,0 +1,14 @@
+{
+  "model": "anthropic/claude-haiku-5.5",
+  "runs": [
+    {
+      "status": "ERROR",
+      "exit": 127,
+      "wall_s": 3.3,
+      "out_chars": 0,
+      "err_chars": 92,
+      "head": "",
+      "name": "smoke"
+    }
+  ]
+}
