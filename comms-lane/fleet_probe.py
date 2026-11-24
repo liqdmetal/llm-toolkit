@@ -33,6 +33,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 # (label, base_url, kind). kind decides which listing endpoint answers.
 #
@@ -134,6 +135,53 @@ def list_resident(base_url, kind, timeout=TIMEOUT):
     return None
 
 
+def _host_of(url):
+    """The MACHINE a lane lives on, not the daemon it reaches.
+
+    Two daemons on one host are one GPU. Measured 2026-11-26: the 5090's ollama
+    (”:11434”) and q38's llama.cpp (":8081") are both 192.168.1.232, so
+    counting daemons as capacity described one loaded card as two idle lanes.
+    """
+    try:
+        return urlsplit(url).hostname or url
+    except ValueError:
+        return url
+
+
+def host_capacity(rows):
+    """Idle capacity per MACHINE, and the daemons whose idleness is misleading.
+
+    A lane's ``serving`` flag answers "is this daemon holding a loaded model".
+    Capacity answers "is this GPU free". They come apart whenever one host runs
+    two inference servers, and they come apart in the expensive direction: an
+    idle ollama daemon on a host whose llama.cpp server has a model loaded reads
+    as spare capacity and invites a dispatch onto a busy card.
+
+    Returns (hosts, free, shared, unread_hosts):
+      hosts        every host with at least one local daemon
+      free         hosts where nothing is serving and at least one daemon answered
+      shared       lanes that are idle on a host that is already serving
+      unread_hosts hosts where no daemon could answer residency at all
+    """
+    by_host = {}
+    for r in rows:
+        if r["resident"] is None and r["resident_error"] is None:
+            continue  # hosted: no residency notion, not part of local capacity
+        by_host.setdefault(_host_of(r["url"]), []).append(r)
+    free, shared, unread_hosts = [], [], []
+    for host, lanes in by_host.items():
+        busy = any(x["serving"] for x in lanes)
+        answered = any(x["resident"] is not None for x in lanes)
+        if not busy and answered:
+            free.append(host)
+        if not answered:
+            unread_hosts.append(host)
+        for x in lanes:
+            if busy and x["resident"] is not None and not x["serving"]:
+                shared.append(x["lane"])
+    return by_host, free, shared, unread_hosts
+
+
 def probe(label, base_url, kind, timeout=TIMEOUT):
     """One lane's state. Never raises: a failure IS the measurement."""
     started = time.time()
@@ -233,6 +281,28 @@ def main(argv):
                 r["lane"] for r in unread)
         print("[%d/%d] local lanes SERVING (idle: %s)"
               % (len(local) - len(idle) - len(unread), len(local), detail))
+        # The lane count above is DAEMONS. Capacity is MACHINES, and the two
+        # differ whenever one host runs more than one inference server --
+        # measured 2026-11-26, the 5090's ollama and q38's llama.cpp are both
+        # 192.168.1.232, so an idle ollama daemon beside a loaded llama.cpp
+        # server rendered as spare capacity on a card that was already busy.
+        # That reading is the expensive direction: it invites a dispatch onto
+        # a busy GPU. So state the machine count too, and name the lanes whose
+        # idleness is an artifact of which daemon was asked.
+        by_host, free, shared, unread_hosts = host_capacity(rows)
+        if by_host:
+            host_word = "host" if len(by_host) == 1 else "hosts"
+            line = "[%d/%d] local %s with idle capacity" % (
+                len(free), len(by_host), host_word)
+            notes = []
+            if shared:
+                notes.append("idle daemons on a busy host: " + ", ".join(shared))
+            if unread_hosts:
+                notes.append("residency unread on: " + ", ".join(
+                    sorted(unread_hosts)))
+            if notes:
+                line += " (" + "; ".join(notes) + ")"
+            print(line)
     return 0
 
 
