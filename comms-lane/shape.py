@@ -20,6 +20,7 @@ import os
 import re
 import socket
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -49,20 +50,63 @@ def _host_port(ollama: str | None = None) -> tuple[str, int]:
     return host, port
 
 
-def preflight(ollama: str | None = None, timeout: float = PROBE_TIMEOUT) -> None:
-    """Raise ShaperUnavailable unless the shaper's host is listening.
+def _installed_models(ollama: str | None, timeout: float) -> set[str] | None:
+    """The model names the shaper host lists, or None if it cannot be read.
 
-    A TCP connect is the honest question: it does not claim the model is
-    loaded, only that the box will accept the request. A box that is reserved
-    for another workload, rebooted, or off the network fails here in
-    milliseconds rather than at the generation timeout.
+    None is NOT an empty set. A listing endpoint that errors says nothing about
+    which models exist, and reading it as "none installed" would refuse every
+    model on a box whose /api/tags is merely unhealthy -- turning a soft
+    dependency into a guaranteed skip.
+
+    /api/tags is a listing endpoint: it reads state and loads nothing, so asking
+    cannot evict the model this is meant to protect.
+    """
+    base = (ollama or OLLAMA).rstrip("/")
+    try:
+        with urllib.request.urlopen(base + "/api/tags", timeout=timeout) as r:
+            doc = json.loads(r.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+            ValueError):
+        return None
+    return {m.get("name") for m in doc.get("models", []) if m.get("name")}
+
+
+def preflight(ollama: str | None = None, timeout: float = PROBE_TIMEOUT,
+              model: str | None = None) -> None:
+    """Raise ShaperUnavailable unless the box is reachable AND carries the model.
+
+    Two questions, because only the first used to be asked and the second is the
+    one a config typo breaks:
+
+    1. Is the host listening? A TCP connect answers that in milliseconds, where
+       a generation attempt would block for TIMEOUT to learn the same thing.
+    2. Does it LIST the configured model? A name that is not installed gets a
+       verbatim HTTP 404 from Ollama's generation endpoint -- MEASURED at 11 ms,
+       so this is not a timeout problem, it is a CONTRACT problem. ROUTING.md
+       rule 1 tells callers to catch ShaperUnavailable and fall back to their
+       own prompt, and an escaping HTTPError is an exception type no caller is
+       told to handle. Shaping then hard-blocks the work it exists to help.
+
+    A listing that FAILS cannot answer question 2, so it does not refuse: only a
+    listing that ANSWERS and omits the model does.
     """
     host, port = _host_port(ollama)
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return
+            pass
     except OSError as e:
-        raise ShaperUnavailable(f"{host}:{port} unreachable ({e.__class__.__name__})") from e
+        raise ShaperUnavailable(
+            f"{host}:{port} unreachable ({e.__class__.__name__})") from e
+
+    wanted = model or MODEL
+    installed = _installed_models(ollama, timeout)
+    if installed is not None and wanted not in installed:
+        near = sorted(n for n in installed
+                      if wanted.split(":")[0].split("/")[-1] in n)[:3]
+        hint = "; nearest on that host: " + ", ".join(sorted(near)) if near else ""
+        raise ShaperUnavailable(
+            f"model {wanted!r} is not installed on {host}:{port} "
+            f"({len(installed)} model(s) listed){hint}")
 
 
 def enabled() -> bool:
@@ -126,8 +170,18 @@ def shape(task: str, system: str = DEFAULT_SYSTEM, timeout: int = TIMEOUT) -> st
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # The installed set can change between the preflight and the
+            # generation, so the same contract is enforced here too: the caller
+            # sees ShaperUnavailable, never a raw HTTPError.
+            raise ShaperUnavailable(
+                f"model {MODEL!r} is not installed on the shaper host "
+                f"(HTTP 404 at generation time)") from e
+        raise
     return _strip_thinking(data.get("response", ""))
 
 
