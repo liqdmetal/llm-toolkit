@@ -46,9 +46,15 @@ NOUS_INFERENCE_BASE = os.environ.get(
         "https://inference-api.nousresearch.com/v1"),
 ).rstrip("/")
 
+# A credential pool that lists openrouter with ZERO entries is not an auth failure
+# to discover later: indexing it raised IndexError at IMPORT time, so the whole
+# client was unimportable on a host whose pool was merely empty. Measured
+# 2026-11-26 on this Runner: `import llm_client` -> IndexError: list index out of
+# range at this line. An empty list and an absent key mean the same thing here,
+# and both mean "no stored key".
+_OPENROUTER_POOL = _AUTH.get("credential_pool", {}).get("openrouter") or []
 _OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY") or (
-    _AUTH.get("credential_pool", {}).get("openrouter", [{}])[0].get(
-        "access_token", "")
+    _OPENROUTER_POOL[0].get("access_token", "") if _OPENROUTER_POOL else ""
 )
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
@@ -71,6 +77,40 @@ def ollama_available(base="http://localhost:11434"):
             return r.status == 200
     except Exception:
         return False
+
+
+def _token_usage(resp, prompt, content):
+    """Token counts that STATE whether they were measured or estimated.
+
+    Ollama /api/generate returns prompt_eval_count and eval_count in the very
+    JSON body this client already parses. It ignored both and reported
+    ``len(text) // 4`` -- a byte heuristic with no tokenizer behind it. A stack
+    whose stated goal is to DECREASE token usage was measuring its own savings
+    with a guess, and the error is not small in the direction that matters:
+
+        MEASURED 2026-11-26, realistic body with prompt_eval_count=917 and
+        eval_count=43: the old code reported prompt=0, completion=45.
+
+    Prompt cost is where shaping and routing decisions are actually paid, and it
+    read as ZERO for every local call. Every "we shaped it and spent less"
+    claim on the local lane was therefore unfalsifiable -- the counter could not
+    see the thing it was counting.
+
+    ABSENT IS NOT ZERO. A counter that is present and 0 is a measurement and is
+    reported as 0; only a counter that is MISSING falls back to the estimate,
+    and the returned ``basis`` says which happened so a caller can refuse to
+    bank an estimate. The fallback keeps the exact old arithmetic, so nothing
+    that already read these numbers changes meaning.
+    """
+    measured_p = resp.get("prompt_eval_count")
+    measured_c = resp.get("eval_count")
+    return {
+        "prompt": len(prompt or "") // 4 if measured_p is None else measured_p,
+        "completion": (len(content or "") // 4 if measured_c is None
+                       else measured_c),
+        "basis": ("measured" if measured_p is not None
+                  and measured_c is not None else "estimated"),
+    }
 
 
 def local_chat(messages, model="qwen3.8-uncensored:27b",
@@ -129,8 +169,7 @@ def local_chat(messages, model="qwen3.8-uncensored:27b",
             "content": content,
             "provider": "local",
             "model": model,
-            "tokens": {"prompt": len(prompt) // 4,
-                       "completion": len(content) // 4},
+            "tokens": _token_usage(resp, prompt, content),
         }
     except Exception as e:
         return {"ok": False, "error": str(e), "provider": "local"}
