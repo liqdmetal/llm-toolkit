@@ -16,13 +16,58 @@ Exits 0 with the shaped prompt, 1 on shaper failure (caller should fall
 through to the raw prompt — never let shaping be a hard dependency).
 """
 import json
+import os
 import re
+import socket
 import sys
+import urllib.parse
 import urllib.request
 
-OLLAMA = "http://192.168.1.124:11434"
-MODEL = "defiant9b-abliterated:256k"
-TIMEOUT = 180
+OLLAMA = os.environ.get("SHAPE_OLLAMA", "http://192.168.1.124:11434")
+MODEL = os.environ.get("SHAPE_MODEL", "defiant9b-abliterated:256k")
+# Generation timeout only. It is generous because the shaper may emit a long
+# thinking preamble before the rewritten prompt.
+TIMEOUT = int(os.environ.get("SHAPE_TIMEOUT", "180"))
+# Reachability probe. Deliberately small: this answers "is the box there at
+# all", which must not cost anywhere near a generation timeout.
+PROBE_TIMEOUT = float(os.environ.get("SHAPE_PROBE_TIMEOUT", "2.0"))
+
+
+class ShaperUnavailable(RuntimeError):
+    """The shaper box cannot be reached, so shaping must be skipped.
+
+    Distinct from a shaping *failure*: this is raised BEFORE any generation is
+    attempted, so a caller falls through to the raw prompt immediately instead
+    of blocking for TIMEOUT seconds to learn the same thing.
+    """
+
+
+def _host_port(ollama: str | None = None) -> tuple[str, int]:
+    u = urllib.parse.urlsplit(ollama or OLLAMA)
+    host = u.hostname or "127.0.0.1"
+    port = u.port or (443 if u.scheme == "https" else 80)
+    return host, port
+
+
+def preflight(ollama: str | None = None, timeout: float = PROBE_TIMEOUT) -> None:
+    """Raise ShaperUnavailable unless the shaper's host is listening.
+
+    A TCP connect is the honest question: it does not claim the model is
+    loaded, only that the box will accept the request. A box that is reserved
+    for another workload, rebooted, or off the network fails here in
+    milliseconds rather than at the generation timeout.
+    """
+    host, port = _host_port(ollama)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return
+    except OSError as e:
+        raise ShaperUnavailable(f"{host}:{port} unreachable ({e.__class__.__name__})") from e
+
+
+def enabled() -> bool:
+    """Shaping is opt-OUT, so a reserved or busy box can be declared off."""
+    return os.environ.get("SHAPE_DISABLE", "").strip().lower() not in ("1", "true", "yes", "on")
 
 DEFAULT_SYSTEM = """You are a prompt engineer for a technical research fleet.
 
@@ -65,6 +110,9 @@ def _strip_thinking(text: str) -> str:
 
 
 def shape(task: str, system: str = DEFAULT_SYSTEM, timeout: int = TIMEOUT) -> str:
+    if not enabled():
+        raise ShaperUnavailable("shaping disabled by SHAPE_DISABLE")
+    preflight()
     payload = {
         "model": MODEL,
         "prompt": task,
@@ -97,6 +145,11 @@ if __name__ == "__main__":
         task = sys.argv[1]
     try:
         print(shape(task, system))
+    except ShaperUnavailable as e:
+        # Soft dependency: the caller uses its original prompt. Reported on a
+        # distinct marker so a skip is never mistaken for a shaping failure.
+        print(f"SHAPE_SKIP: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"SHAPE_FAIL: {e}", file=sys.stderr)
         sys.exit(1)
