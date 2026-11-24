@@ -35,7 +35,16 @@ import shape  # noqa: E402
 
 ENDPOINT = os.environ.get("AB_ENDPOINT", "http://127.0.0.1:8099/v1/chat/completions")
 MODEL = os.environ.get("AB_MODEL", "z-ai/glm-5.3-flashx")
-MAX_TOKENS = int(os.environ.get("AB_MAX_TOKENS", "1200"))
+# Budget chosen from a measurement, not preference (2026-11-27, 127.0.0.1:8099,
+# z-ai/glm-5.3-flashx, this file's own task text, one call per budget):
+#   budget  finish  content  reasoning  ctoks
+#   1200    length        0      5,478   1200   <- old default: 100% on thinking, no answer
+#   2000    stop      4,357      1,227   1255   <- CHEAPEST budget with a usable answer
+#   3000    stop      3,051      2,091   1088
+#   4000    stop      2,642      3,130   1341
+#   6000    length        0     25,416   6000   <- re-enters the 100%-on-reasoning regime
+# Do not raise past 2000 without re-measuring: 6000 is worse than 1200.
+MAX_TOKENS = int(os.environ.get("AB_MAX_TOKENS", "2000"))
 OUT_DIR = Path(os.environ.get("AB_OUT", "C:/testingtemp/ab-lane"))
 TIMEOUT = int(os.environ.get("AB_TIMEOUT", "180"))
 

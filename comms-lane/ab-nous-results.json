@@ -1,13 +1,15 @@
 {
   "endpoint": "http://127.0.0.1:8099/v1/chat/completions",
-  "model": "minimax/minimax-m3.1-flash",
+  "model": "z-ai/glm-5.3-flashx",
   "runs": [
     {
-      "status": "ERROR",
+      "status": "TRUNCATED",
       "finish": "length",
-      "wall_s": 8.8,
+      "wall_s": 22.3,
       "content_chars": 0,
-      "reasoning_chars": 5361,
+      "reasoning_chars": 8957,
+      "completion_tokens": 2000,
+      "wasted_completion_tokens": 2000,
       "head": "",
       "name": "framing",
       "condition": "raw",
@@ -16,24 +18,28 @@
       "note": ""
     },
     {
-      "status": "ERROR",
-      "finish": "length",
-      "wall_s": 4.6,
-      "content_chars": 0,
-      "reasoning_chars": 5899,
-      "head": "",
+      "status": "ANSWER",
+      "finish": "stop",
+      "wall_s": 10.2,
+      "content_chars": 1067,
+      "reasoning_chars": 2072,
+      "completion_tokens": 640,
+      "wasted_completion_tokens": 0,
+      "head": "I'd be glad to help with mining software optimization, but I need more context to give you a useful answer. I don't have enough information about what you're referring to.\n\n**Could you clarify:**\n\n- What is \"pearl miner\"? (specific software name, GPU/CPU miner, algorithm, etc.)\n- What hardware are y",
       "name": "framing",
       "condition": "shaped",
       "task_label": "Refusal-bait framing (adversarial but legitimate ask)",
-      "prompt_chars": 620,
-      "note": "shaped 620c"
+      "prompt_chars": 529,
+      "note": "shaped 529c"
     },
     {
-      "status": "ERROR",
+      "status": "TRUNCATED",
       "finish": "length",
-      "wall_s": 16.5,
+      "wall_s": 18.4,
       "content_chars": 0,
-      "reasoning_chars": 4869,
+      "reasoning_chars": 8335,
+      "completion_tokens": 2000,
+      "wasted_completion_tokens": 2000,
       "head": "",
       "name": "giant",
       "condition": "raw",
@@ -42,17 +48,19 @@
       "note": ""
     },
     {
-      "status": "ERROR",
+      "status": "TRUNCATED",
       "finish": "length",
-      "wall_s": 8.5,
+      "wall_s": 20.0,
       "content_chars": 0,
-      "reasoning_chars": 5500,
+      "reasoning_chars": 9189,
+      "completion_tokens": 2000,
+      "wasted_completion_tokens": 2000,
       "head": "",
       "name": "giant",
       "condition": "shaped",
       "task_label": "Giant undivided ask (no decomposition)",
-      "prompt_chars": 992,
-      "note": "shaped 992c"
+      "prompt_chars": 480,
+      "note": "shaped 480c"
     }
   ]
 }
