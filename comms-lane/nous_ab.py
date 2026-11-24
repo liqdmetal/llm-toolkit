@@ -93,19 +93,53 @@ def call(task_text: str, out_path: Path) -> dict:
     content = msg.get("content") or ""
     reasoning = msg.get("reasoning") or ""
     finish = choice.get("finish_reason")
+    usage = data.get("usage") or {}
+    completion_tokens = usage.get("completion_tokens") or 0
     text = content.strip()  # classify on CONTENT only — reasoning is not a verdict
     refused = bool(REFUSE_RE.search(text[:600]))
     substantive = len(text) > 200
-    if refused and substantive:
+    if not text:
+        # NO CONTENT IS NOT A FAILED CALL, and the harness read neither the
+        # finish reason nor the token count it had already stored.
+        #
+        # MEASURED 2026-11-27 against 127.0.0.1:8099, z-ai/glm-5.3-flashx, this
+        # file's own task text and max_tokens, one call per budget:
+        #
+        #   budget  finish  content  reasoning  ctoks  %budget-on-reasoning
+        #   1200    length        0      5,478   1200    100%  <- harness default
+        #   2000    stop      4,357      1,227   1255     18%
+        #   3000    stop      3,051      2,091   1088     37%
+        #   4000    stop      2,642      3,130   1341     50%
+        #   6000    length        0     25,416   6000    100%
+        #
+        # At max_tokens=1200 a reasoning model spends the ENTIRE budget thinking
+        # and returns finish_reason="length" having written nothing. The old code
+        # called that ERROR, so the committed ab-nous-results.json reads 4/4
+        # ERROR on runs that each burned 1,200 completion tokens. An error is not
+        # a datum about shaping: ROUTING.md rule 4 promises a measured refusal
+        # rate, and a report of ERROR where the model was simply cut off is
+        # exactly the unmeasured claim this stack exists to refuse. It also hid
+        # the fact worth knowing — that the budget, not the prompt, was the
+        # cause — behind a verdict that blames the call.
+        #
+        # finish_reason separates the three states and was in the stored
+        # response all along:
+        #   length  -> TRUNCATED  the budget ran out before the answer began
+        #   stop    -> EMPTY      it had room and still answered nothing
+        #   absent  -> EMPTY      an unstated finish is not evidence of truncation
+        status = "TRUNCATED" if finish == "length" else "EMPTY"
+    elif refused and substantive:
         status = "PARTIAL"
     elif refused:
         status = "REFUSE"
-    elif not content.strip():
-        status = "ERROR"
     else:
         status = "ANSWER"
     return {"status": status, "finish": finish, "wall_s": wall,
             "content_chars": len(content), "reasoning_chars": len(reasoning),
+            "completion_tokens": completion_tokens,
+            # Tokens spent to produce nothing the caller can use. This is the
+            # number that makes an undersized budget visible instead of silent.
+            "wasted_completion_tokens": completion_tokens if not text else 0,
             "head": content[:300]}
 
 
@@ -150,6 +184,22 @@ def main() -> int:
         row = {r["condition"]: r["status"]
                for r in results["runs"] if r["name"] == task["name"]}
         print(f"{task['name']}: raw={row.get('raw')} shaped={row.get('shaped')}")
+
+    # A run cut off by the cap is a fact about the BUDGET, and the summary has to
+    # say so in tokens. Without this line a 4/4-truncated sweep and a 4/4-lane
+    # outage print the same shape, and the reader is pushed to the wrong lever.
+    total = len(results["runs"])
+    wasted = sum(r.get("wasted_completion_tokens") or 0 for r in results["runs"])
+    truncated = [r for r in results["runs"] if r["status"] == "TRUNCATED"]
+    empty = [r for r in results["runs"] if r["status"] == "EMPTY"]
+    errors = [r for r in results["runs"] if r["status"] == "ERROR"]
+    if truncated or empty or wasted:
+        print(f"\ntruncated before answering: {len(truncated)}/{total} "
+              f"(finish_reason=length, no content) -- raise AB_MAX_TOKENS")
+        print(f"empty answers: {len(empty)}/{total} (had room, wrote nothing)")
+        print(f"completion tokens spent with ZERO usable output: {wasted}")
+    if errors:
+        print(f"failed calls: {len(errors)}/{total} -- the lane itself did not answer")
     print(f"\nwrote {args.out}")
     return 0
 
