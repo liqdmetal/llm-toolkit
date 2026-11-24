@@ -27,8 +27,16 @@ exist on the 5090, and the abliterated model lives on the 3090.
 
 Sensitive reasoning therefore routes to the **3090**, which holds
 `defiant9b-abliterated:256k` (what `shape.py` already defaults to). The 5090 is
-not a heretic box today; it holds small Qwen and a vision model. Both boxes
-report an empty `/api/ps`, i.e. up and idle — capacity that is not being used.
+not a heretic box today; it holds small Qwen and a vision model.
+
+DO NOT read an empty `/api/ps` as an idle MACHINE. The 5090's ollama answers
+`{"models":[]}` while `http://192.168.1.232:8081/health` — q38's llama.cpp
+server on the SAME host — answers 200 with a model loaded. MEASURED
+2026-11-26: `[2/3] local lanes SERVING (idle: 5090)` was true per DAEMON and
+false per HOST, and `[0/2] local hosts with idle capacity` was the honest
+figure. The distinction is the expensive direction: counting daemons as
+capacity invites a dispatch onto a card that is already busy. Capacity is
+counted in MACHINES by `host_capacity()`, never in HTTP daemons.
 
 Run `python comms-lane/fleet_probe.py` before claiming a lane is available. The
 probe lists models only (`/api/tags`, `/v1/models`) and never starts a
