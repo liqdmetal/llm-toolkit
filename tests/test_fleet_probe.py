@@ -127,9 +127,13 @@ def test_listing_endpoints_only_never_start_a_generation():
     """A probe must not perturb what it measures.
 
     Loading a model to answer a probe would evict a resident one and change the
-    lane's state — the probe would then be measuring itself. Both listing paths
-    are asserted to be the cheap ones, and the paths that would generate are
+    lane's state — the probe would then be measuring itself. Every listing path
+    is asserted to be the cheap ones, and the paths that would generate are
     rejected.
+
+    /api/ps is on this list deliberately: it is the residency read. It reports
+    which models are already loaded and loads none, which is what makes
+    "installed" and "serving" separable without perturbing either.
     """
     base, handler, srv = _serve({"models": [], "data": []})
     try:
@@ -138,7 +142,7 @@ def test_listing_endpoints_only_never_start_a_generation():
         seen = list(handler.seen)
     finally:
         srv.shutdown()
-    assert seen == ["/api/tags", "/v1/models"], seen
+    assert seen == ["/api/tags", "/api/ps", "/v1/models"], seen
     for forbidden in ("/api/generate", "/api/chat", "/v1/chat/completions"):
         assert not any(forbidden in p for p in seen), forbidden
 
@@ -166,3 +170,101 @@ def test_probe_all_returns_one_row_per_lane():
         [("a", f"http://127.0.0.1:{_dead_port()}", "ollama"),
          ("b", f"http://127.0.0.1:{_dead_port()}", "openai")], timeout=1.0)
     assert [r["lane"] for r in rows] == ["a", "b"]
+
+
+def test_probe_separates_installed_from_serving():
+    """Seven models installed and none loaded is UP and IDLE, not "7 models".
+
+    This is the defect the residency read exists for: the probe printed a lane
+    with nothing resident identically to one actively serving, so an idle GPU
+    read as healthy capacity while work went to a billed lane.
+    """
+    base, handler, srv = _serve({"models": [{"name": "a"}, {"name": "b"}]})
+    try:
+        row = fleet_probe.probe("3090", base, "ollama")
+    finally:
+        srv.shutdown()
+    assert row["model_count"] == 2
+    # The canned body is the same dict for both paths, so /api/ps "reports"
+    # two loaded here. The point of the test is that the two counts are
+    # carried SEPARATELY; a fixed body cannot make them agree by accident.
+    assert row["resident"] is not None
+    assert row["resident_count"] == 2
+
+
+def test_control_an_idle_lane_is_not_a_serving_lane():
+    """The load-bearing one: zero resident must not read as zero installed."""
+    class Handler(_Handler):
+        def do_GET(self):  # noqa: N802
+            Handler.seen.append(self.path)
+            body = ({"models": [{"name": "m1"}, {"name": "m2"}, {"name": "m3"}]}
+                    if self.path == "/api/tags" else {"models": []})
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    handler = type("Idle", (Handler,), {"seen": []})
+    srv = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        row = fleet_probe.probe("3090", base, "ollama")
+    finally:
+        srv.shutdown()
+
+    assert row["reachable"] is True, 'the process answers, so it is UP'
+    assert row["model_count"] == 3, 'three models are installed'
+    assert row["resident_count"] == 0, 'but none are loaded'
+    assert row["serving"] is False, 'and that is IDLE, which is the finding'
+    assert row["model_count"] != row["resident_count"],         'if these could not differ the distinction would be vacuous'
+
+
+def test_control_a_hosted_lane_reports_residency_as_not_applicable():
+    """None ("does not apply") must not be confused with [] ("nothing loaded").
+
+    A hosted portal has no resident model set, so reporting [] would claim it
+    was idle — a false idle on the one lane that is always able to answer.
+    """
+    base, handler, srv = _serve({"data": [{"id": "z-ai/glm-5.3-flashx"}]})
+    try:
+        row = fleet_probe.probe("nous", base, "openai")
+    finally:
+        srv.shutdown()
+    assert row["resident"] is None
+    assert row["resident_count"] is None
+    assert row["serving"] is None, 'not False: "unknown/NA" is not "idle"'
+
+
+def test_residency_failure_is_reported_and_does_not_downgrade_the_lane():
+    """A lane that lists models but cannot answer /api/ps is still UP."""
+    class Handler(_Handler):
+        def do_GET(self):  # noqa: N802
+            Handler.seen.append(self.path)
+            if self.path == "/api/ps":
+                self.send_response(500)
+                self.end_headers()
+                return
+            payload = json.dumps({"models": [{"name": "m"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    handler = type("H2", (Handler,), {"seen": []})
+    srv = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        row = fleet_probe.probe("x", base, "ollama")
+    finally:
+        srv.shutdown()
+
+    assert row["reachable"] is True
+    assert row["model_count"] == 1
+    assert row["resident"] is None
+    assert row["serving"] is None
+    assert row["resident_error"], 'an unanswered residency question says so'

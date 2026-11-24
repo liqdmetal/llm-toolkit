@@ -60,17 +60,47 @@ def list_models(base_url, kind, timeout=TIMEOUT):
     raise ValueError("unknown lane kind: %r" % (kind,))
 
 
+def list_resident(base_url, kind, timeout=TIMEOUT):
+    """Models the lane currently has LOADED and able to answer right now.
+
+    Returns a list, or None where the question does not apply. Ollama answers
+    /api/ps; a hosted OpenAI-shaped portal has no equivalent notion, so it gets
+    None ("not applicable") rather than [] ("nothing loaded") -- the two must
+    not be confused, which is the whole point of this function.
+
+    /api/ps is a listing endpoint like /api/tags: it reads state and loads
+    nothing, so probing cannot evict the model it is measuring.
+    """
+    if kind != "ollama":
+        return None
+    doc = _get(base_url.rstrip("/") + "/api/ps", timeout)
+    return [m.get("name") or m.get("model") or "?" for m in doc.get("models", [])]
+
+
 def probe(label, base_url, kind, timeout=TIMEOUT):
     """One lane's state. Never raises: a failure IS the measurement."""
     started = time.time()
     try:
         models = list_models(base_url, kind, timeout)
+        # Reachable says the process answers; residency says it can serve now.
+        # A lane with 7 models installed and none loaded is UP and IDLE, and
+        # reporting only "7 models" made those two states identical.
+        try:
+            resident = list_resident(base_url, kind, timeout)
+            resident_error = None
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+                ValueError, KeyError) as exc:
+            resident, resident_error = None, "%s: %s" % (type(exc).__name__, exc)
         return {
             "lane": label,
             "url": base_url,
             "reachable": True,
             "models": models,
             "model_count": len(models),
+            "resident": resident,
+            "resident_count": None if resident is None else len(resident),
+            "serving": None if resident is None else bool(resident),
+            "resident_error": resident_error,
             "latency_ms": round((time.time() - started) * 1000),
             "error": None,
         }
@@ -82,6 +112,10 @@ def probe(label, base_url, kind, timeout=TIMEOUT):
             "reachable": False,
             "models": [],
             "model_count": 0,
+            "resident": None,
+            "resident_count": None,
+            "serving": None,
+            "resident_error": None,
             "latency_ms": round((time.time() - started) * 1000),
             "error": "%s: %s" % (type(exc).__name__, exc),
         }
@@ -99,12 +133,31 @@ def main(argv):
         return 0
     width = max(len(r["lane"]) for r in rows)
     for r in rows:
-        state = "UP  " if r["reachable"] else "DOWN"
-        detail = ("%d models, %d ms" % (r["model_count"], r["latency_ms"])
-                  if r["reachable"] else r["error"])
-        print("  %-*s %s  %s" % (width, r["lane"], state, detail))
+        if not r["reachable"]:
+            print("  %-*s DOWN  %s" % (width, r["lane"], r["error"]))
+            continue
+        if r["resident"] is None:
+            serving = "hosted"
+        elif r["serving"]:
+            serving = "serving %d" % r["resident_count"]
+        else:
+            serving = "IDLE 0/%d loaded" % r["model_count"]
+        print("  %-*s UP    %d installed, %s, %d ms"
+              % (width, r["lane"], r["model_count"], serving, r["latency_ms"]))
+        if r["resident_error"]:
+            print("  %-*s       residency unknown: %s"
+                  % (width, r["lane"], r["resident_error"]))
     up = sum(1 for r in rows if r["reachable"])
     print("[%d/%d] lanes reachable" % (up, len(rows)))
+    # The number that was invisible before: local capacity that is up and
+    # doing nothing. A reachable-but-idle lane is the expensive default this
+    # tool exists to expose, because the router falls through to a billed one.
+    local = [r for r in rows if r["resident"] is not None]
+    idle = [r for r in local if not r["serving"]]
+    if local:
+        print("[%d/%d] local lanes SERVING (idle: %s)"
+              % (len(local) - len(idle), len(local),
+                 ", ".join(r["lane"] for r in idle) or "none"))
     return 0
 
 
