@@ -152,12 +152,24 @@ def main(argv):
     # The number that was invisible before: local capacity that is up and
     # doing nothing. A reachable-but-idle lane is the expensive default this
     # tool exists to expose, because the router falls through to a billed one.
-    local = [r for r in rows if r["resident"] is not None]
-    idle = [r for r in local if not r["serving"]]
+    #
+    # `resident` is None for TWO different situations and they must not be
+    # filtered together: a hosted lane has no residency notion at all, while a
+    # LOCAL lane whose /api/ps failed is a lane that could not be asked. Building
+    # the denominator from `resident is not None` dropped the second kind, so a
+    # local lane that answered /api/ps and then failed rendered as if it were
+    # not in the fleet -- the count got SMALLER and HEALTHIER than the truth.
+    local = [r for r in rows
+             if r["resident"] is not None or r["resident_error"] is not None]
+    idle = [r for r in local if r["resident"] is not None and not r["serving"]]
+    unread = [r for r in local if r["resident"] is None]
     if local:
+        detail = ", ".join(r["lane"] for r in idle) or "none"
+        if unread:
+            detail += "; residency unread: " + ", ".join(
+                r["lane"] for r in unread)
         print("[%d/%d] local lanes SERVING (idle: %s)"
-              % (len(local) - len(idle), len(local),
-                 ", ".join(r["lane"] for r in idle) or "none"))
+              % (len(local) - len(idle) - len(unread), len(local), detail))
     return 0
 
 
