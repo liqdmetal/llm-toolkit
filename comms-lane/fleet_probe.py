@@ -35,9 +35,17 @@ import urllib.error
 import urllib.request
 
 # (label, base_url, kind). kind decides which listing endpoint answers.
+#
+# q38 is a llama.cpp server on the SAME HOST as the 5090's ollama daemon, and it
+# is a separate lane on purpose: measured 2026-11-26, the 5090's /api/ps answered
+# {"models":[]} (ollama idle) while http://192.168.1.232:8081/health answered 200
+# with `Server: llama.cpp` and a model loaded. Asking only the ollama question
+# reported that box as IDLE while it was serving -- the exact fall-through to a
+# billed lane this tool exists to catch.
 LANES = [
     ("nous", "http://127.0.0.1:8099", "openai"),
     ("5090", "http://192.168.1.232:11434", "ollama"),
+    ("q38", "http://192.168.1.232:8081", "llamacpp"),
     ("3090", "http://192.168.1.124:11434", "ollama"),
 ]
 
@@ -49,14 +57,47 @@ def _get(url, timeout=TIMEOUT):
         return json.loads(r.read().decode())
 
 
+def _status_and_json(url, timeout=TIMEOUT):
+    """Return (http_status, parsed_json_or_None); never raise on 4xx/5xx.
+
+    `_get` raises through urllib on an HTTP error, which is right for a listing
+    endpoint that must deliver data. llama.cpp's readiness signal is the
+    opposite: a 503 IS the answer (model still loading), so the status has to be
+    readable rather than exceptional.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            raw, status = r.read(), r.status
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    try:
+        return status, json.loads(raw.decode())
+    except ValueError:
+        return status, None
+
+
 def list_models(base_url, kind, timeout=TIMEOUT):
-    """The model names a lane reports. Raises on anything that is not a listing."""
+    """The model names a lane reports. Raises on anything that is not a listing.
+
+    Returns None where the lane CANNOT answer the question, which is different
+    from [] (it answered, nothing installed). llama.cpp's /v1/models is key-gated
+    on this fleet and answers 401, so a count of 0 there would be a fabricated
+    absence -- the same defect this probe exists to catch, one field over.
+    """
+    base = base_url.rstrip("/")
     if kind == "ollama":
-        doc = _get(base_url.rstrip("/") + "/api/tags", timeout)
+        doc = _get(base + "/api/tags", timeout)
         return [m["name"] for m in doc.get("models", [])]
     if kind == "openai":
-        doc = _get(base_url.rstrip("/") + "/v1/models", timeout)
+        doc = _get(base + "/v1/models", timeout)
         return [m["id"] for m in doc.get("data", [])]
+    if kind == "llamacpp":
+        status, doc = _status_and_json(base + "/v1/models", timeout)
+        if status in (401, 403):
+            return None  # key-gated: unknown, never "none installed"
+        if status != 200:
+            raise ValueError("llamacpp /v1/models answered HTTP %s" % status)
+        return [m["id"] for m in (doc or {}).get("data", [])]
     raise ValueError("unknown lane kind: %r" % (kind,))
 
 
@@ -70,11 +111,27 @@ def list_resident(base_url, kind, timeout=TIMEOUT):
 
     /api/ps is a listing endpoint like /api/tags: it reads state and loads
     nothing, so probing cannot evict the model it is measuring.
+
+    llama.cpp answers /health instead: 200 when a model is loaded and serving,
+    503 during its load window. That is a readiness signal, not a name list, and
+    the name is not recoverable without the key -- so a ready server reports ONE
+    resident whose name is marked unknown rather than inventing one.
     """
-    if kind != "ollama":
-        return None
-    doc = _get(base_url.rstrip("/") + "/api/ps", timeout)
-    return [m.get("name") or m.get("model") or "?" for m in doc.get("models", [])]
+    base = base_url.rstrip("/")
+    if kind == "ollama":
+        doc = _get(base + "/api/ps", timeout)
+        return [m.get("name") or m.get("model") or "?"
+                for m in doc.get("models", [])]
+    if kind == "llamacpp":
+        status, _doc = _status_and_json(base + "/health", timeout)
+        if status == 200:
+            # Ready. The model NAME is behind the key gate, so it is stated as
+            # unknown instead of guessed.
+            return ["<loaded; name key-gated>"]
+        if status == 503:
+            return []  # loading: up, but no capacity yet
+        raise ValueError("llamacpp /health answered HTTP %s" % status)
+    return None
 
 
 def probe(label, base_url, kind, timeout=TIMEOUT):
@@ -96,7 +153,7 @@ def probe(label, base_url, kind, timeout=TIMEOUT):
             "url": base_url,
             "reachable": True,
             "models": models,
-            "model_count": len(models),
+            "model_count": None if models is None else len(models),
             "resident": resident,
             "resident_count": None if resident is None else len(resident),
             "serving": None if resident is None else bool(resident),
@@ -136,14 +193,20 @@ def main(argv):
         if not r["reachable"]:
             print("  %-*s DOWN  %s" % (width, r["lane"], r["error"]))
             continue
+        # model_count is None where the lane cannot answer the listing question
+        # (a key-gated /v1/models). Rendering that as 0 would report a
+        # fabricated absence, which is the defect this probe exists to catch.
+        count = "? installed" if r["model_count"] is None \
+            else "%d installed" % r["model_count"]
         if r["resident"] is None:
             serving = "hosted"
         elif r["serving"]:
             serving = "serving %d" % r["resident_count"]
         else:
-            serving = "IDLE 0/%d loaded" % r["model_count"]
-        print("  %-*s UP    %d installed, %s, %d ms"
-              % (width, r["lane"], r["model_count"], serving, r["latency_ms"]))
+            serving = "IDLE 0/%s loaded" % (
+                "?" if r["model_count"] is None else r["model_count"])
+        print("  %-*s UP    %s, %s, %d ms"
+              % (width, r["lane"], count, serving, r["latency_ms"]))
         if r["resident_error"]:
             print("  %-*s       residency unknown: %s"
                   % (width, r["lane"], r["resident_error"]))
