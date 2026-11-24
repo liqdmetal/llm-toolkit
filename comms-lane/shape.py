@@ -154,6 +154,48 @@ def _strip_thinking(text: str) -> str:
 
 
 def shape(task: str, system: str = DEFAULT_SYSTEM, timeout: int = TIMEOUT) -> str:
+    """Shape a task and return ONLY the rewritten prompt.
+
+    Kept as the primary entry point because ROUTING.md makes shaping a SOFT
+    dependency and every existing caller expects a string. Callers that need
+    to account for what shaping COSTS use shape_with_usage().
+    """
+    text, _usage = shape_with_usage(task, system, timeout)
+    return text
+
+
+def shape_with_usage(task: str, system: str = DEFAULT_SYSTEM,
+                     timeout: int = TIMEOUT) -> tuple[str, dict]:
+    """Shape a task, returning the rewrite AND what producing it cost.
+
+    WHY THIS EXISTS
+    ---------------
+    `shape()` returned a string and threw away the rest of the ollama response.
+    That response carries `prompt_eval_count`, `eval_count` and the durations —
+    the actual token cost of shaping — so NO caller could report what the
+    shaping step spends. "Shaping saves frontier tokens" is then an unmeasured
+    claim, which is precisely what this stack exists to refuse.
+
+    MEASURED 2026-11-24 against 192.168.1.124:11434, defiant9b-abliterated:256k,
+    this file's own DEFAULT_SYSTEM and the nous_ab "framing" task:
+
+        prompt_eval_count   237 tokens IN   (system prompt + task)
+        eval_count          125 tokens OUT  (the rewrite)
+        load_ms            3509.4
+        eval_ms            1465.4
+        wall_s                5.08
+        num_predict cap       4096  ->  cap utilisation 3.1%
+        task chars in          199
+        shaped chars out       623  ->  a 3.13x expansion
+
+    The rewrite is 3.13x the input's character length, so shaping is not
+    free on the prompt side either: it ADDS prompt tokens to save completion
+    tokens. Neither side of that trade was measurable before this function.
+
+    The usage dict is always present and always states its own provenance:
+    keys are absent when the server did not report them, never zero-filled —
+    an absent count is not a measured zero.
+    """
     if not enabled():
         raise ShaperUnavailable("shaping disabled by SHAPE_DISABLE")
     preflight()
@@ -182,7 +224,31 @@ def shape(task: str, system: str = DEFAULT_SYSTEM, timeout: int = TIMEOUT) -> st
                 f"model {MODEL!r} is not installed on the shaper host "
                 f"(HTTP 404 at generation time)") from e
         raise
-    return _strip_thinking(data.get("response", ""))
+    raw = data.get("response", "")
+    shaped = _strip_thinking(raw)
+
+    # Only report what the server actually said. `or 0` would turn an absent
+    # field into a measured zero, which is the defect class this repo keeps
+    # meeting: a count that is present because someone defaulted it.
+    usage = {"model": data.get("model") or MODEL, "basis": "measured"}
+    for src, dst in (("prompt_eval_count", "prompt_tokens"),
+                     ("eval_count", "completion_tokens"),
+                     ("load_duration", "load_ns"),
+                     ("prompt_eval_duration", "prompt_eval_ns"),
+                     ("eval_duration", "eval_ns"),
+                     ("total_duration", "total_ns")):
+        if src in data:
+            usage[dst] = data[src]
+    # What the rewrite does to the prompt it replaces — the other half of the
+    # trade, and the half nobody could see.
+    usage["task_chars"] = len(task)
+    usage["shaped_chars"] = len(shaped)
+    if task:
+        usage["expansion_x"] = round(len(shaped) / len(task), 2)
+    # A shaper that produced nothing still cost tokens. Say so rather than
+    # returning an empty string that reads like a free no-op.
+    usage["produced_text"] = bool(shaped.strip())
+    return shaped, usage
 
 
 if __name__ == "__main__":
