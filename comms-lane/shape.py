@@ -79,6 +79,35 @@ def _is_model_load_failure(body: str) -> bool:
 
 
 
+def _load_failure_cause(body: str) -> str:
+    """The cause the server itself reported, or a statement that it gave none.
+
+    The skip message used to assert ONE cause -- "that box has no room for it
+    right now" -- for every load failure. MEASURED 2026-11-28 against
+    _is_model_load_failure: three genuinely different bodies (CUDA out of
+    memory, a corrupt GGUF tensor, an unknown model architecture) all
+    classified as load failures and all produced that identical sentence, so an
+    operator with a corrupt file was told the card was full and would go hunting
+    for VRAM that was never the problem. The 3090's /api/ps was EMPTY the whole
+    time -- nothing held the card; the model was simply not loadable.
+
+    A cause the body does not state must not be named. Order matters: the CUDA
+    OOM body also carries "llama-server process has terminated", which is the
+    symptom rather than the cause.
+    """
+    low = body.lower()
+    if ("out of memory" in low or "failed to allocate" in low
+            or "cudamalloc failed" in low):
+        return "the backend reported out of memory"
+    if "corrupted" in low or "not within the file bounds" in low:
+        return "the backend reported the model file is corrupt"
+    if "unknown model architecture" in low or "unsupported model" in low:
+        return "the backend reported this architecture is not supported"
+    if "llama-server process has terminated" in low:
+        return "the backend process terminated and stated no cause"
+    return "the backend stated no cause"
+
+
 def _host_port(ollama: str | None = None) -> tuple[str, int]:
     u = urllib.parse.urlsplit(ollama or OLLAMA)
     host = u.hostname or "127.0.0.1"
@@ -270,8 +299,7 @@ def shape_with_usage(task: str, system: str = DEFAULT_SYSTEM,
             _h, _p = _host_port()
             raise ShaperUnavailable(
                 f"model {MODEL!r} is listed on {_h}:{_p} but could not be "
-                f"loaded (HTTP {e.code}); that box has no room for it right "
-                f"now") from e
+                f"loaded (HTTP {e.code}); {_load_failure_cause(body)}") from e
         raise
     raw = data.get("response", "")
     shaped = _strip_thinking(raw)
