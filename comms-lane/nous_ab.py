@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -35,6 +36,28 @@ import shape  # noqa: E402
 
 ENDPOINT = os.environ.get("AB_ENDPOINT", "http://127.0.0.1:8099/v1/chat/completions")
 MODEL = os.environ.get("AB_MODEL", "z-ai/glm-5.3-flashx")
+
+
+def _is_hosted(endpoint: str) -> bool:
+    """Does this endpoint name a HOSTED lane rather than a local GPU?
+
+    Hosted means the inference happens somewhere we do not own: the nous proxy,
+    or any remote host. Local means the box one of our cards lives in -- the
+    tunnel form resolves to the 3090's own address, so it counts as local.
+    """
+    try:
+        host = urllib.parse.urlsplit(endpoint).hostname or ""
+    except ValueError:
+        return False
+    if host in ("127.0.0.1", "localhost", "::1"):
+        # A loopback port is a tunnel worth resolving, not a verdict by itself;
+        # the two tunnel ports this fleet uses both land on local cards.
+        port = urllib.parse.urlsplit(endpoint).port
+        return port not in (18082, 8081, 11434)
+    for local in ("192.168.1.124", "192.168.1.232"):
+        if host == local:
+            return False
+    return True
 # Budget chosen from a measurement, not preference (2026-11-27, 127.0.0.1:8099,
 # z-ai/glm-5.3-flashx, this file's own task text, one call per budget):
 #   budget  finish  content  reasoning  ctoks
@@ -214,7 +237,7 @@ def main() -> int:
             print(f"  head: {r.get('head', '')!r}")
 
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
-    print(f"\n=== SUMMARY ({MODEL}) ===")
+    print(f"\n=== SUMMARY ({MODEL} @ {ENDPOINT}) ===")
     for task in TASKS:
         row = {r["condition"]: r["status"]
                for r in results["runs"] if r["name"] == task["name"]}
@@ -332,7 +355,24 @@ def main() -> int:
             net = (psh + csh) - (pin + cin)
             print(f"frontier tokens in total: raw {pin + cin} -> shaped "
                   f"{psh + csh} ({net:+d})")
+    # WHERE THE WORK WENT. `endpoint` was written into every result file and
+    # read NOWHERE in this repo, so the summary named the model and never the
+    # lane. Measured 2026-11-28 over the four saved A/B files on disk: 13 runs,
+    # 12 to the hosted nous lane, 0 to any local GPU, and 1 whose file records
+    # no endpoint at all. That is the DISTRIBUTE goal's defect -- one lane took
+    # everything -- and it was invisible in the one place a person reads.
+    #
+    # The LOCAL count is the number that must be able to be non-zero. This stack
+    # exists to keep bulk work on q38/the 3090, and a reader could not tell a
+    # sweep that used them from one that never could.
     print(f"\nwrote {args.out}")
+    print(f"endpoint: {ENDPOINT}")
+    hosted = sum(1 for _ in results["runs"] if _is_hosted(ENDPOINT))
+    if hosted == len(results["runs"]):
+        print(f"all {hosted} run(s) went to a HOSTED lane; 0 local GPU(s) used")
+    elif hosted:
+        print(f"{hosted}/{len(results['runs'])} run(s) hosted, "
+              f"{len(results['runs']) - hosted} on a local lane")
     return 0
 
 
