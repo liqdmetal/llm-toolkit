@@ -43,6 +43,42 @@ class ShaperUnavailable(RuntimeError):
     """
 
 
+# A model that is LISTED but cannot be LOADED is not a shaping failure -- it is
+# the box being unable to serve the model right now, which ROUTING.md rule 1
+# says must fall through to the raw prompt. Ollama reports it as a generic
+# HTTP 500 whose body carries the backend's own message, so the body is the
+# only place the distinction exists. MEASURED 2026-11-28 against the real 3090
+# (192.168.1.124:11434) with defiant9b-abliterated:256k listed and Inkling
+# holding the card:
+#
+#   HTTP 500 {"error": "llama-server process has terminated: exit status 1:
+#                     ggml_backend_cuda_device_get_memory: cudaMemGetInfo
+#                     failed (out of memory) ... cudaMalloc failed: out of
+#                     memory ... failed to allocate CUDA0 buffer of size
+#                     52690944 ... failed to initialize the context"}
+#
+# Through the CLI that read `SHAPE_FAIL: HTTP Error 500: Internal Server
+# Error` where the contract calls for `SHAPE_SKIP: ...`.
+_LOAD_FAILURE_MARKERS = (
+    "out of memory",
+    "failed to allocate",
+    "llama-server process has terminated",
+    "failed to load model",
+    "unable to load model",
+)
+
+
+def _is_model_load_failure(body: str) -> bool:
+    """True only for a body that says the model could not be brought up.
+
+    Deliberately narrow: an unrelated 500 must stay a raised error rather than
+    being relabelled a skip, or every server bug becomes silent capacity loss.
+    """
+    low = body.lower()
+    return any(m in low for m in _LOAD_FAILURE_MARKERS)
+
+
+
 def _host_port(ollama: str | None = None) -> tuple[str, int]:
     u = urllib.parse.urlsplit(ollama or OLLAMA)
     host = u.hostname or "127.0.0.1"
@@ -223,6 +259,17 @@ def shape_with_usage(task: str, system: str = DEFAULT_SYSTEM,
             raise ShaperUnavailable(
                 f"model {MODEL!r} is not installed on the shaper host "
                 f"(HTTP 404 at generation time)") from e
+        # A listed model that cannot be brought up (typically the card is full)
+        # is the same contract: skip to the raw prompt, do not hard-block.
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:                                   # noqa: BLE001
+            body = ""
+        if _is_model_load_failure(body):
+            raise ShaperUnavailable(
+                f"model {MODEL!r} is listed on the shaper host but could not be "
+                f"loaded (HTTP {e.code}); the box has no room for it right now") \
+                from e
         raise
     raw = data.get("response", "")
     shaped = _strip_thinking(raw)
