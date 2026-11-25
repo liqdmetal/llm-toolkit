@@ -256,8 +256,9 @@ def shape_with_usage(task: str, system: str = DEFAULT_SYSTEM,
             # The installed set can change between the preflight and the
             # generation, so the same contract is enforced here too: the caller
             # sees ShaperUnavailable, never a raw HTTPError.
+            _h, _p = _host_port()
             raise ShaperUnavailable(
-                f"model {MODEL!r} is not installed on the shaper host "
+                f"model {MODEL!r} is not installed on {_h}:{_p} "
                 f"(HTTP 404 at generation time)") from e
         # A listed model that cannot be brought up (typically the card is full)
         # is the same contract: skip to the raw prompt, do not hard-block.
@@ -266,10 +267,11 @@ def shape_with_usage(task: str, system: str = DEFAULT_SYSTEM,
         except Exception:                                   # noqa: BLE001
             body = ""
         if _is_model_load_failure(body):
+            _h, _p = _host_port()
             raise ShaperUnavailable(
-                f"model {MODEL!r} is listed on the shaper host but could not be "
-                f"loaded (HTTP {e.code}); the box has no room for it right now") \
-                from e
+                f"model {MODEL!r} is listed on {_h}:{_p} but could not be "
+                f"loaded (HTTP {e.code}); that box has no room for it right "
+                f"now") from e
         raise
     raw = data.get("response", "")
     shaped = _strip_thinking(raw)
