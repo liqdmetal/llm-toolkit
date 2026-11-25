@@ -58,6 +58,32 @@ def _is_hosted(endpoint: str) -> bool:
         if host == local:
             return False
     return True
+
+
+def _lane_kind(endpoint: str) -> str:
+    """Which lane an endpoint names: "local", "hosted", or "unknown".
+
+    `_is_hosted` answers a narrower question -- "is this NOT one of our cards"
+    -- and returns True for an endpoint that names no host at all, because an
+    unparseable or relative URL falls through its last `return True`. That fold
+    is right for `_is_hosted`'s own contract and wrong for a summary: "I cannot
+    place this work" and "this work went to a BILLED lane" are different
+    answers, and the second is a spend claim.
+
+    MEASURED at aa8939e: _is_hosted(None), _is_hosted("") and
+    _is_hosted("v1/chat/completions") all return True, so AB_ENDPOINT=""
+    printed "all 4 run(s) went to a HOSTED lane; 0 local GPU(s) used" over four
+    runs whose lane nobody recorded.
+    """
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        return "unknown"
+    try:
+        parts = urllib.parse.urlsplit(endpoint)
+    except ValueError:
+        return "unknown"
+    if not parts.hostname:
+        return "unknown"
+    return "hosted" if _is_hosted(endpoint) else "local"
 # Budget chosen from a measurement, not preference (2026-11-27, 127.0.0.1:8099,
 # z-ai/glm-5.3-flashx, this file's own task text, one call per budget):
 #   budget  finish  content  reasoning  ctoks
@@ -366,13 +392,26 @@ def main() -> int:
     # exists to keep bulk work on q38/the 3090, and a reader could not tell a
     # sweep that used them from one that never could.
     print(f"\nwrote {args.out}")
-    print(f"endpoint: {ENDPOINT}")
-    hosted = sum(1 for _ in results["runs"] if _is_hosted(ENDPOINT))
-    if hosted == len(results["runs"]):
-        print(f"all {hosted} run(s) went to a HOSTED lane; 0 local GPU(s) used")
-    elif hosted:
-        print(f"{hosted}/{len(results['runs'])} run(s) hosted, "
-              f"{len(results['runs']) - hosted} on a local lane")
+    # Print the endpoint the FILE records, not the live env var: they are the
+    # same object today, and the file is the thing a reader re-opens.
+    endpoint = results["endpoint"]
+    print(f"endpoint: {endpoint}")
+    # THREE outcomes, not two. The count used to be
+    #   hosted = sum(1 for _ in results["runs"] if _is_hosted(ENDPOINT))
+    # which folds "no recorded lane" into the hosted bucket -- _is_hosted
+    # returns True for None, "" and any URL naming no host -- and had no local
+    # sentence at all, because both branches required hosted != 0. So a sweep
+    # to a card printed its endpoint and no count, and a sweep with
+    # AB_ENDPOINT="" printed a full hosted sweep.
+    lane = _lane_kind(endpoint)
+    total = len(results["runs"])
+    if lane == "unknown":
+        print(f"{total} run(s): LANE UNKNOWN -- no endpoint was recorded ({endpoint!r}),"
+              f" so this file cannot say whether any local GPU was used")
+    elif lane == "local":
+        print(f"all {total} run(s) went to a LOCAL lane; 0 hosted call(s) used")
+    else:
+        print(f"all {total} run(s) went to a HOSTED lane; 0 local GPU(s) used")
     return 0
 
 
