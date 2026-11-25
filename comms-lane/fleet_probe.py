@@ -48,7 +48,28 @@ LANES = [
     ("5090", "http://192.168.1.232:11434", "ollama"),
     ("q38", "http://192.168.1.232:8081", "llamacpp"),
     ("3090", "http://192.168.1.124:11434", "ollama"),
+    # The 3090 runs TWO servers, exactly like the 5090 does, and asking only its
+    # ollama daemon read the box as idle while llama.cpp served Inkling on it.
+    # MEASURED 2026-11-28: /api/ps answered {"models":[]} (so "IDLE 0/7") and a
+    # 3-token /api/generate died in 4.0 s with "cudaMemGetInfo failed (out of
+    # memory)" because Inkling held the card, while the tunnel below --
+    # ssh -L 18082:127.0.0.1:8082 to the 3090 -- answered {"status":"ok"} to
+    # /health. Reporting a serving lane as idle is the fall-through to a billed
+    # lane this tool exists to prevent, and it is the same defect the 5090 got
+    # fixed for in test_fleet_llamacpp_lane.py, one box over.
+    ("3090-inkling", "http://127.0.0.1:18082", "llamacpp"),
 ]
+
+# A lane reached through an SSH tunnel answers on LOOPBACK, but the machine it
+# measures is the FAR END. Without this map the 3090 is counted twice -- once
+# serving (as 127.0.0.1) and once idle-with-7-installed (as 192.168.1.124) --
+# and the two readings disagree about the same card in the expensive direction:
+# the idle half invites a shaping dispatch onto a card that then fails to load.
+# Attribute a tunnel to its far end; that is the only attribution under which
+# "one host = one GPU" is true.
+TUNNEL_HOSTS = {
+    "http://127.0.0.1:18082": "192.168.1.124",
+}
 
 TIMEOUT = 6.0
 
@@ -142,6 +163,9 @@ def _host_of(url):
     (”:11434”) and q38's llama.cpp (":8081") are both 192.168.1.232, so
     counting daemons as capacity described one loaded card as two idle lanes.
     """
+    key = url.rstrip("/")
+    if key in TUNNEL_HOSTS:
+        return TUNNEL_HOSTS[key]
     try:
         return urlsplit(url).hostname or url
     except ValueError:
