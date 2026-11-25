@@ -473,11 +473,25 @@ def main(argv):
             # configured, set FLEET_LANE_API_KEY_Q38" is a report that never
             # tells the operator the one action that would turn it into a
             # measurement.
+            # THREE states here, not two. MEASURED 2026-11-29: with NO key
+            # configured the line blamed the missing key; with a WRONG key
+            # configured it said nothing at all, so "you never set the
+            # variable" and "you set it and the server rejected it" -- the
+            # two failures an operator must distinguish, because one is fixed
+            # by setting a variable and the other by correcting its value --
+            # rendered identically. The second is the worse one to be silent
+            # about: the operator has done the thing the report asked and the
+            # report stops talking, which reads as success.
             unnamed = [r["lane"] for r in gated if not r.get("key_source")]
-            hint = ""
+            refused = [r for r in gated if r.get("key_source")]
+            hints = []
             if unnamed:
-                hint = (" -- no API key configured; set %s or %s"
-                        % (key_env_name(unnamed[0]), LANE_KEY_ENV))
+                hints.append("no API key configured; set %s or %s"
+                             % (key_env_name(unnamed[0]), LANE_KEY_ENV))
+            for r in refused:
+                hints.append("%s sent %s and the server refused it"
+                             % (r["lane"], r["key_source"]))
+            hint = (" -- " + "; ".join(hints)) if hints else ""
             print("[%d] serving local lane(s) whose busy count could not be "
                   "read (not counted as free): %s%s"
                   % (len(gated), ", ".join(r["lane"] for r in gated), hint))
