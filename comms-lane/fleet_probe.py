@@ -292,8 +292,21 @@ def main(argv):
         by_host, free, shared, unread_hosts = host_capacity(rows)
         if by_host:
             host_word = "host" if len(by_host) == 1 else "hosts"
-            line = "[%d/%d] local %s with idle capacity" % (
-                len(free), len(by_host), host_word)
+            # NOT "idle capacity". This probe deliberately never starts a
+            # generation, so the strongest fact it can establish is that no
+            # daemon on the host is SERVING right now. Capacity is a
+            # different claim, and they came apart in the expensive
+            # direction: MEASURED 2026-11-26, the 3090 answered
+            # {"models":[]} to /api/ps while every generation on it died
+            # "cudaMemGetInfo failed (out of memory)" because inkling held
+            # the card. This line called that box "[1/2] idle capacity", and
+            # a router reading it dispatches into a host that cannot load,
+            # gets nothing back, and falls through to the billed lane this
+            # tool exists to keep it off. State what was measured and name
+            # the limit beside it.
+            line = ("[%d/%d] local %s with no daemon serving "
+                    "(capacity NOT established: a listed model can still "
+                    "fail to load)") % (len(free), len(by_host), host_word)
             notes = []
             if shared:
                 notes.append("idle daemons on a busy host: " + ", ".join(shared))
