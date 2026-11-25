@@ -58,6 +58,18 @@ LANES = [
     # lane this tool exists to prevent, and it is the same defect the 5090 got
     # fixed for in test_fleet_llamacpp_lane.py, one box over.
     ("3090-inkling", "http://127.0.0.1:18082", "llamacpp"),
+    # The 3090 runs a THIRD server and it was invisible to this roster entirely.
+    # MEASURED 2026-11-28: loopback 8090 is an ssh tunnel --
+    #   ssh -fN -i ...\a3090_ed25519 -L 8090:127.0.0.1:8090 a3090@192.168.1.124
+    # (PID 7824, netstat) -- and it answers keyless with a model loaded:
+    #   /health 200 {"status":"ok"}, /v1/models 200 -> /home/a3090/mm/defiant-vision.gguf,
+    #   /slots 4 slots, 0 busy, n_ctx 4096 each.
+    # So the same box printed "3090 UP 7 installed, IDLE 0/7 loaded" while a
+    # llama.cpp server on it held defiant-vision. Same defect as the 5090's
+    # ollama-beside-llama.cpp (2026-11-26) and the 3090's ollama-beside-Inkling
+    # (2026-11-28), a third daemon later: asking one kind of daemon and printing
+    # the answer as the box's state.
+    ("3090-defiant", "http://127.0.0.1:8090", "llamacpp"),
 ]
 
 # A lane reached through an SSH tunnel answers on LOOPBACK, but the machine it
@@ -69,6 +81,11 @@ LANES = [
 # "one host = one GPU" is true.
 TUNNEL_HOSTS = {
     "http://127.0.0.1:18082": "192.168.1.124",
+    # Its sibling on the same far end. Both tunnels answer on loopback and both
+    # measure the 3090; without this the box is counted three times -- idle on
+    # its ollama daemon, serving Inkling, serving defiant-vision -- and the
+    # idle third is what a router would act on.
+    "http://127.0.0.1:8090": "192.168.1.124",
 }
 
 TIMEOUT = 6.0
