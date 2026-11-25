@@ -165,6 +165,7 @@ def main() -> int:
         for cond in ("raw", "shaped"):
             text = task["raw"]
             note = ""
+            shaped_ok = False
             if cond == "shaped":
                 try:
                     s = shape.shape(text)
@@ -174,18 +175,25 @@ def main() -> int:
                 if s:
                     text = s
                     note = f"shaped {len(s)}c"
+                    shaped_ok = True
                 else:
                     note = note or "shaper-empty-fallback-raw"
             out_path = OUT_DIR / f"nous-{task['name']}-{cond}.json"
             r = call(text, out_path)
             r.update(name=task["name"], condition=cond,
                      task_label=task["label"], prompt_chars=len(text),
-                     note=note)
+                     note=note, shaped_applied=shaped_ok)
             results["runs"].append(r)
             print(f"[{task['name']}/{cond}] {r['status']} "
                   f"finish={r.get('finish')} wall={r['wall_s']}s "
                   f"content={r.get('content_chars')}c {note}")
-            print(f"  head: {r['head']!r}")
+            # A failed call has no head to show: call() returns no 'head' key
+            # when the request itself raised, and reading r['head'] here killed
+            # main() with a KeyError on the FIRST lane failure -- before the
+            # 'failed calls: N/N' summary line could ever print. The one report
+            # that explains a dead lane was unreachable exactly when it was
+            # needed.
+            print(f"  head: {r.get('head', '')!r}")
 
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"\n=== SUMMARY ({MODEL}) ===")
@@ -209,6 +217,30 @@ def main() -> int:
         print(f"completion tokens spent with ZERO usable output: {wasted}")
     if errors:
         print(f"failed calls: {len(errors)}/{total} -- the lane itself did not answer")
+
+    # The shaped arm is a COMPARISON only if shaping ran. When the shaper is
+    # unavailable (a card held by another model, a rename, a refusal) every
+    # "shaped" run falls back to the raw text, so the two arms send byte-identical
+    # prompts and any delta between them is the lane's own drift. The summary has
+    # to say that, because "raw=X shaped=X" otherwise reads as "shaping did not
+    # help" when the truth is "shaping never happened".
+    shaped_runs = [r for r in results["runs"] if r["condition"] == "shaped"]
+    applied = [r for r in shaped_runs if r.get("shaped_applied")]
+    skipped = len(shaped_runs) - len(applied)
+    if shaped_runs:
+        causes = sorted({r.get("note", "").split(":")[0]
+                         for r in shaped_runs if not r.get("shaped_applied")})
+        if not applied:
+            print(f"\nshaped arm NEVER SHAPED: 0/{len(shaped_runs)} runs were "
+                  f"rewritten -- every shaped run sent the raw text, so the two "
+                  f"arms are the same prompt and any delta below is the lane's "
+                  f"drift, NOT a shaping effect")
+        elif skipped:
+            print(f"\nshaped arm rewrote {len(applied)}/{len(shaped_runs)} runs; "
+                  f"{skipped} fell back to raw ({', '.join(c for c in causes if c)})"
+                  f" -- the comparison is mixed, not pure")
+        else:
+            print(f"\nshaped arm rewrote {len(applied)}/{len(shaped_runs)} runs")
     print(f"\nwrote {args.out}")
     return 0
 
