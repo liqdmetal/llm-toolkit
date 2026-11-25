@@ -166,7 +166,15 @@ def main() -> int:
             text = task["raw"]
             note = ""
             shaped_ok = False
+            shaping_wall_s = None
             if cond == "shaped":
+                # Time the shaping step itself. MEASURED 2026-11-28: a shaper
+                # whose listed model cannot be loaded costs 3.5-5.6 s per
+                # dispatch to fail, and nothing recorded that, so the summary
+                # could not tell "shaping is expensive and bought nothing"
+                # from "shaping was never attempted". `wall_s` covers the
+                # frontier call only.
+                _t_sh = time.perf_counter()
                 try:
                     s = shape.shape(text)
                 except Exception as e:
@@ -178,11 +186,13 @@ def main() -> int:
                     shaped_ok = True
                 else:
                     note = note or "shaper-empty-fallback-raw"
+                shaping_wall_s = round(time.perf_counter() - _t_sh, 3)
             out_path = OUT_DIR / f"nous-{task['name']}-{cond}.json"
             r = call(text, out_path)
             r.update(name=task["name"], condition=cond,
                      task_label=task["label"], prompt_chars=len(text),
-                     note=note, shaped_applied=shaped_ok)
+                     note=note, shaped_applied=shaped_ok,
+                     shaping_wall_s=shaping_wall_s)
             results["runs"].append(r)
             print(f"[{task['name']}/{cond}] {r['status']} "
                   f"finish={r.get('finish')} wall={r['wall_s']}s "
@@ -225,11 +235,18 @@ def main() -> int:
     # to say that, because "raw=X shaped=X" otherwise reads as "shaping did not
     # help" when the truth is "shaping never happened".
     shaped_runs = [r for r in results["runs"] if r["condition"] == "shaped"]
+    shaping_spent_s = round(
+        sum(r.get("shaping_wall_s") or 0.0 for r in shaped_runs), 3)
     applied = [r for r in shaped_runs if r.get("shaped_applied")]
     skipped = len(shaped_runs) - len(applied)
     if shaped_runs:
         causes = sorted({r.get("note", "").split(":")[0]
                          for r in shaped_runs if not r.get("shaped_applied")})
+        if shaping_spent_s > 0 and not applied:
+            print(f"\ntime spent shaping and buying nothing: "
+                  f"{shaping_spent_s}s over {len(shaped_runs)} attempts -- "
+                  f"every attempt was a dispatch the shaper could not serve, "
+                  f"and no token was saved by any")
         if not applied:
             print(f"\nshaped arm NEVER SHAPED: 0/{len(shaped_runs)} runs were "
                   f"rewritten -- every shaped run sent the raw text, so the two "
