@@ -173,6 +173,43 @@ def list_resident(base_url, kind, timeout=TIMEOUT):
     return None
 
 
+def read_slots(base_url, kind, timeout=TIMEOUT):
+    """(total_slots, busy_slots) for a llama.cpp server; None where N/A.
+
+    Residency answers "is a model loaded", which is what ``serving`` means. It
+    does NOT answer "is this server busy right now": a loaded server with every
+    slot free renders identically to a saturated one. MEASURED 2026-11-28 --
+    the defiant-vision tunnel answered ``/slots`` with 4 slots, 0 busy, while
+    this probe printed ``serving 1`` and nothing else. That is spare capacity
+    the fleet report could not see, which is the expensive direction for the
+    goal this tool serves: work gets dispatched to a billed lane because the
+    local one looked as busy as it can.
+
+    ``/slots`` is a STATE READ. It lists the server's in-flight work and starts
+    none, so it satisfies the standing rule that a probe must not perturb what
+    it measures. It is also KEY-GATED on some boxes: measured 2026-11-28, q38
+    (127.0.0.1:8081 by way of the .232 host) answered 401 and the Inkling
+    tunnel (18082) answered 401, while the defiant-vision tunnel (8090)
+    answered. A 401 is NOT "no slots" and NOT "0 busy" -- it is "could not
+    ask", and the caller must render it as unknown rather than as a measured
+    zero. Raising is how this function says so; the caller decides the wording.
+    """
+    if kind != "llamacpp":
+        return None
+    base = base_url.rstrip("/")
+    doc = _get(base + "/slots", timeout)
+    if not isinstance(doc, list):
+        raise ValueError("/slots answered %s, not a list" % type(doc).__name__)
+    busy = 0
+    for slot in doc:
+        # A slot mid-prefill or mid-decode both count as busy; only a truly
+        # free slot is capacity.
+        if isinstance(slot, dict) and (
+                slot.get("is_processing") or slot.get("is_processing_prompt")):
+            busy += 1
+    return len(doc), busy
+
+
 def _host_of(url):
     """The MACHINE a lane lives on, not the daemon it reaches.
 
@@ -237,6 +274,12 @@ def probe(label, base_url, kind, timeout=TIMEOUT):
         except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                 ValueError, KeyError) as exc:
             resident, resident_error = None, "%s: %s" % (type(exc).__name__, exc)
+        try:
+            slots = read_slots(base_url, kind, timeout)
+            slots_error = None
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+                ValueError, KeyError) as exc:
+            slots, slots_error = None, "%s: %s" % (type(exc).__name__, exc)
         return {
             "lane": label,
             "url": base_url,
@@ -247,6 +290,8 @@ def probe(label, base_url, kind, timeout=TIMEOUT):
             "resident_count": None if resident is None else len(resident),
             "serving": None if resident is None else bool(resident),
             "resident_error": resident_error,
+            "slots": slots,
+            "slots_error": slots_error,
             "latency_ms": round((time.time() - started) * 1000),
             "error": None,
         }
@@ -262,6 +307,8 @@ def probe(label, base_url, kind, timeout=TIMEOUT):
             "resident_count": None,
             "serving": None,
             "resident_error": None,
+            "slots": None,
+            "slots_error": None,
             "latency_ms": round((time.time() - started) * 1000),
             "error": "%s: %s" % (type(exc).__name__, exc),
         }
@@ -291,6 +338,17 @@ def main(argv):
             serving = "hosted"
         elif r["serving"]:
             serving = "serving %d" % r["resident_count"]
+            # "serving" says a model is LOADED. It does not say the server is
+            # busy, and those two came apart in the direction that costs money:
+            # a loaded server with every slot free looked exactly like a
+            # saturated one. State the slots when they were read; when the read
+            # was refused (key-gated) say UNKNOWN rather than print nothing,
+            # because silence there reads as "no spare capacity".
+            if r.get("slots") is not None:
+                slots_total, slots_busy = r["slots"]
+                serving += ", %d/%d slots busy" % (slots_busy, slots_total)
+            elif r.get("slots_error"):
+                serving += ", slots UNKNOWN"
         else:
             serving = "IDLE 0/%s loaded" % (
                 "?" if r["model_count"] is None else r["model_count"])
@@ -322,6 +380,27 @@ def main(argv):
                 r["lane"] for r in unread)
         print("[%d/%d] local lanes SERVING (idle: %s)"
               % (len(local) - len(idle) - len(unread), len(local), detail))
+        # MEASURED spare capacity, which is not the same claim as the host line
+        # below. A loaded llama.cpp server whose /slots answered 0 busy is a
+        # server that CAN take work right now -- the model is loaded, so it
+        # cannot fail to load the way the host line warns about. Only lanes
+        # whose /slots was actually READ appear here; a key-gated lane is not
+        # counted as full, and not counted as free either.
+        spare = [r for r in local
+                 if r.get("slots") is not None and r["slots"][0] > 0
+                 and r["slots"][1] == 0]
+        if spare:
+            print("[%d] loaded local server(s) with every slot free (MEASURED "
+                  "spare capacity: %s)"
+                  % (len(spare), ", ".join(
+                      "%s 0/%d" % (r["lane"], r["slots"][0]) for r in spare)))
+        gated = [r for r in local
+                 if r.get("slots") is None and r.get("slots_error")
+                 and r.get("serving")]
+        if gated:
+            print("[%d] serving local lane(s) whose busy count could not be "
+                  "read (not counted as free): %s"
+                  % (len(gated), ", ".join(r["lane"] for r in gated)))
         # The lane count above is DAEMONS. Capacity is MACHINES, and the two
         # differ whenever one host runs more than one inference server --
         # measured 2026-11-26, the 5090's ollama and q38's llama.cpp are both
