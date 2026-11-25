@@ -29,6 +29,7 @@ Exit 0 whether lanes are up or down: a down lane is data, not an error of the
 probe. Only a broken probe exits non-zero.
 """
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -90,13 +91,64 @@ TUNNEL_HOSTS = {
 
 TIMEOUT = 6.0
 
+# Optional per-lane API key. Some llama.cpp servers on this fleet key-gate
+# BOTH /v1/models and /slots and answer 401 without one. MEASURED 2026-11-29 by
+# reading all three local lanes keyless:
+#
+#     q38           /health 200   /v1/models 401   /slots 401
+#     3090-inkling  /health 200   /v1/models 401   /slots 401
+#     3090-defiant  /health 200   /v1/models 200   /slots 200
+#
+# So /health is the only keyless read, and it answers exactly one bit: a model
+# is loaded. Spare capacity lives in /slots, which two of the three loaded
+# servers will not surrender without a key. Before this, `fleet_probe` had no
+# way to send one, so those two lanes printed `slots UNKNOWN` on every run
+# forever -- capacity that demonstrably exists and is never measured, while the
+# router reads unknown as "do not dispatch there" and falls through to a billed
+# lane. That is the exact expensive default this tool exists to prevent.
+#
+# The key is read from the environment and never stored in the row. The row
+# records WHICH variable supplied it (`key_source`), never its value, because a
+# report that prints a secret to a terminal and into --json is a leak that
+# outlives the run.
+LANE_KEY_ENV = "FLEET_LANE_API_KEY"          # fallback for every lane
+LANE_KEY_ENV_PREFIX = "FLEET_LANE_API_KEY_"   # per-lane override
 
-def _get(url, timeout=TIMEOUT):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+
+def key_env_name(label):
+    """The environment variable that may hold an API key for this lane."""
+    slug = "".join(c if c.isalnum() else "_" for c in label).upper()
+    return LANE_KEY_ENV_PREFIX + slug
+
+
+def key_for(label):
+    """(key, source_var) for a lane; (None, None) when nothing is configured.
+
+    Per-lane first, then the shared fallback. Returns the variable NAME as well
+    as the value so a caller can say which knob to turn without ever printing
+    the secret itself.
+    """
+    for name in (key_env_name(label), LANE_KEY_ENV):
+        val = os.environ.get(name)
+        if val and val.strip():
+            return val.strip(), name
+    return None, None
+
+
+def _request(url, timeout=TIMEOUT, key=None):
+    """An open urlopen response, carrying the key when one was configured."""
+    req = urllib.request.Request(url)
+    if key:
+        req.add_header("Authorization", "Bearer " + key)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _get(url, timeout=TIMEOUT, key=None):
+    with _request(url, timeout, key) as r:
         return json.loads(r.read().decode())
 
 
-def _status_and_json(url, timeout=TIMEOUT):
+def _status_and_json(url, timeout=TIMEOUT, key=None):
     """Return (http_status, parsed_json_or_None); never raise on 4xx/5xx.
 
     `_get` raises through urllib on an HTTP error, which is right for a listing
@@ -105,7 +157,7 @@ def _status_and_json(url, timeout=TIMEOUT):
     readable rather than exceptional.
     """
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with _request(url, timeout, key) as r:
             raw, status = r.read(), r.status
     except urllib.error.HTTPError as e:
         return e.code, None
@@ -115,7 +167,7 @@ def _status_and_json(url, timeout=TIMEOUT):
         return status, None
 
 
-def list_models(base_url, kind, timeout=TIMEOUT):
+def list_models(base_url, kind, timeout=TIMEOUT, key=None):
     """The model names a lane reports. Raises on anything that is not a listing.
 
     Returns None where the lane CANNOT answer the question, which is different
@@ -125,13 +177,13 @@ def list_models(base_url, kind, timeout=TIMEOUT):
     """
     base = base_url.rstrip("/")
     if kind == "ollama":
-        doc = _get(base + "/api/tags", timeout)
+        doc = _get(base + "/api/tags", timeout, key)
         return [m["name"] for m in doc.get("models", [])]
     if kind == "openai":
-        doc = _get(base + "/v1/models", timeout)
+        doc = _get(base + "/v1/models", timeout, key)
         return [m["id"] for m in doc.get("data", [])]
     if kind == "llamacpp":
-        status, doc = _status_and_json(base + "/v1/models", timeout)
+        status, doc = _status_and_json(base + "/v1/models", timeout, key)
         if status in (401, 403):
             return None  # key-gated: unknown, never "none installed"
         if status != 200:
@@ -140,7 +192,7 @@ def list_models(base_url, kind, timeout=TIMEOUT):
     raise ValueError("unknown lane kind: %r" % (kind,))
 
 
-def list_resident(base_url, kind, timeout=TIMEOUT):
+def list_resident(base_url, kind, timeout=TIMEOUT, key=None):
     """Models the lane currently has LOADED and able to answer right now.
 
     Returns a list, or None where the question does not apply. Ollama answers
@@ -158,11 +210,11 @@ def list_resident(base_url, kind, timeout=TIMEOUT):
     """
     base = base_url.rstrip("/")
     if kind == "ollama":
-        doc = _get(base + "/api/ps", timeout)
+        doc = _get(base + "/api/ps", timeout, key)
         return [m.get("name") or m.get("model") or "?"
                 for m in doc.get("models", [])]
     if kind == "llamacpp":
-        status, _doc = _status_and_json(base + "/health", timeout)
+        status, _doc = _status_and_json(base + "/health", timeout, key)
         if status == 200:
             # Ready. The model NAME is behind the key gate, so it is stated as
             # unknown instead of guessed.
@@ -173,7 +225,7 @@ def list_resident(base_url, kind, timeout=TIMEOUT):
     return None
 
 
-def read_slots(base_url, kind, timeout=TIMEOUT):
+def read_slots(base_url, kind, timeout=TIMEOUT, key=None):
     """(total_slots, busy_slots) for a llama.cpp server; None where N/A.
 
     Residency answers "is a model loaded", which is what ``serving`` means. It
@@ -197,7 +249,7 @@ def read_slots(base_url, kind, timeout=TIMEOUT):
     if kind != "llamacpp":
         return None
     base = base_url.rstrip("/")
-    doc = _get(base + "/slots", timeout)
+    doc = _get(base + "/slots", timeout, key)
     if not isinstance(doc, list):
         raise ValueError("/slots answered %s, not a list" % type(doc).__name__)
     busy = 0
@@ -260,22 +312,29 @@ def host_capacity(rows):
     return by_host, free, shared, unread_hosts
 
 
-def probe(label, base_url, kind, timeout=TIMEOUT):
-    """One lane's state. Never raises: a failure IS the measurement."""
+def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
+    """One lane's state. Never raises: a failure IS the measurement.
+
+    ``key`` is optional and, when given, is sent as a bearer token on every
+    read. The row records the NAME of the variable that supplied it and never
+    the value, so a report can say "this lane was read with a key" without
+    writing a secret into a terminal scrollback or a --json file.
+    """
     started = time.time()
+    key_src = key_for(label)[1] if key else None
     try:
-        models = list_models(base_url, kind, timeout)
+        models = list_models(base_url, kind, timeout, key)
         # Reachable says the process answers; residency says it can serve now.
         # A lane with 7 models installed and none loaded is UP and IDLE, and
         # reporting only "7 models" made those two states identical.
         try:
-            resident = list_resident(base_url, kind, timeout)
+            resident = list_resident(base_url, kind, timeout, key)
             resident_error = None
         except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                 ValueError, KeyError) as exc:
             resident, resident_error = None, "%s: %s" % (type(exc).__name__, exc)
         try:
-            slots = read_slots(base_url, kind, timeout)
+            slots = read_slots(base_url, kind, timeout, key)
             slots_error = None
         except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                 ValueError, KeyError) as exc:
@@ -292,6 +351,7 @@ def probe(label, base_url, kind, timeout=TIMEOUT):
             "resident_error": resident_error,
             "slots": slots,
             "slots_error": slots_error,
+            "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
             "error": None,
         }
@@ -309,13 +369,21 @@ def probe(label, base_url, kind, timeout=TIMEOUT):
             "resident_error": None,
             "slots": None,
             "slots_error": None,
+            "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
             "error": "%s: %s" % (type(exc).__name__, exc),
         }
 
 
 def probe_all(lanes=LANES, timeout=TIMEOUT):
-    return [probe(label, url, kind, timeout) for label, url, kind in lanes]
+    """One row per lane, resolving each lane's own key (or none).
+
+    The key is resolved per lane here rather than passed down from main(), so a
+    caller that builds its own lane list still gets the same behaviour, and so
+    the environment is read at probe time instead of at import.
+    """
+    return [probe(label, url, kind, timeout, key_for(label)[0])
+            for label, url, kind in lanes]
 
 
 def main(argv):
@@ -398,9 +466,21 @@ def main(argv):
                  if r.get("slots") is None and r.get("slots_error")
                  and r.get("serving")]
         if gated:
+            # Name the KNOB, not just the gap. MEASURED 2026-11-29: q38 and the
+            # Inkling tunnel both answer 401 on /v1/models AND /slots, so this
+            # line printed on every run for two loaded servers forever. A
+            # report that says "unknown" and not "unknown because no key was
+            # configured, set FLEET_LANE_API_KEY_Q38" is a report that never
+            # tells the operator the one action that would turn it into a
+            # measurement.
+            unnamed = [r["lane"] for r in gated if not r.get("key_source")]
+            hint = ""
+            if unnamed:
+                hint = (" -- no API key configured; set %s or %s"
+                        % (key_env_name(unnamed[0]), LANE_KEY_ENV))
             print("[%d] serving local lane(s) whose busy count could not be "
-                  "read (not counted as free): %s"
-                  % (len(gated), ", ".join(r["lane"] for r in gated)))
+                  "read (not counted as free): %s%s"
+                  % (len(gated), ", ".join(r["lane"] for r in gated), hint))
         # The lane count above is DAEMONS. Capacity is MACHINES, and the two
         # differ whenever one host runs more than one inference server --
         # measured 2026-11-26, the 5090's ollama and q38's llama.cpp are both
