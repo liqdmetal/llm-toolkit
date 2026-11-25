@@ -228,6 +228,33 @@ def main() -> int:
     if errors:
         print(f"failed calls: {len(errors)}/{total} -- the lane itself did not answer")
 
+    # Reasoning spend: recorded at ONE site and, before this line, read at NONE.
+    #
+    # `reasoning_chars` was written into every run record and never summed by
+    # anything in this repo, so a reasoning model's largest cost was a number
+    # nothing displayed -- the same defect as a guard nobody calls. MEASURED
+    # 2026-11-28 over the saved runs on disk: ab-nous-qwen.json 19,402 chars of
+    # content against 107,648 of reasoning (5.55x), and ab-nous-results.json
+    # 1,067 against 28,553 (26.76x). A lane where thinking outweighs answering
+    # 27:1 is a lane whose budget is being spent on text the caller never sees,
+    # which is exactly the figure a "decrease token usage" goal has to be able
+    # to read before it can claim anything.
+    #
+    # Chars, not tokens: these records carry no reasoning token count, and
+    # converting chars to tokens with a guessed divisor is the fabricated number
+    # this stack exists to refuse. The ratio is exact; the token split is not
+    # available and is not invented here.
+    reasoning_chars = sum(r.get("reasoning_chars") or 0 for r in results["runs"])
+    content_chars = sum(r.get("content_chars") or 0 for r in results["runs"])
+    if reasoning_chars:
+        ratio = reasoning_chars / max(1, content_chars)
+        print(
+            f"\nreasoning spend: {reasoning_chars}c of reasoning against "
+            f"{content_chars}c of answer ({ratio:.2f}x) -- this is text "
+            f"the caller never receives, and no token count for it is "
+            f"recorded"
+        )
+
     # The shaped arm is a COMPARISON only if shaping ran. When the shaper is
     # unavailable (a card held by another model, a rename, a refusal) every
     # "shaped" run falls back to the raw text, so the two arms send byte-identical
