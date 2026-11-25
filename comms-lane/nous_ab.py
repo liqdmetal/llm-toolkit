@@ -104,6 +104,12 @@ def call(task_text: str, out_path: Path) -> dict:
     finish = choice.get("finish_reason")
     usage = data.get("usage") or {}
     completion_tokens = usage.get("completion_tokens") or 0
+    # The frontier INPUT side and the reasoning split. Both were in the response
+    # this function already writes to disk, and both were dropped here -- no
+    # zero-fill: an absent count is not a measured zero.
+    prompt_tokens = usage.get("prompt_tokens")
+    reasoning_tokens = (usage.get("completion_tokens_details") or {}).get(
+        "reasoning_tokens")
     text = content.strip()  # classify on CONTENT only — reasoning is not a verdict
     refused = bool(REFUSE_RE.search(text[:600]))
     substantive = len(text) > 200
@@ -145,6 +151,8 @@ def call(task_text: str, out_path: Path) -> dict:
         status = "ANSWER"
     return {"status": status, "finish": finish, "wall_s": wall,
             "content_chars": len(content), "reasoning_chars": len(reasoning),
+            "prompt_tokens": prompt_tokens,
+            "reasoning_tokens": reasoning_tokens,
             "completion_tokens": completion_tokens,
             # Tokens spent to produce nothing the caller can use. This is the
             # number that makes an undersized budget visible instead of silent.
@@ -285,6 +293,45 @@ def main() -> int:
                   f" -- the comparison is mixed, not pure")
         else:
             print(f"\nshaped arm rewrote {len(applied)}/{len(shaped_runs)} runs")
+
+    # THE TOKEN TRADE, per arm. `wasted_completion_tokens` was the only frontier
+    # count this summary ever printed, and it answers a different question (was
+    # the BUDGET big enough), so the "decrease token usage" goal had no figure
+    # to move. `prompt_tokens` was in every saved response on disk and read at
+    # NONE -- the same defect class as reasoning_chars above, on the input side.
+    #
+    # MEASURED 2026-11-28 over the four saved responses in the scratch out-dir,
+    # z-ai/glm-5.3-flashx, this file's own two tasks:
+    #
+    #   task     prompt        completion          reasoning
+    #   framing  60 -> 108    2000 -> 640        1998 -> 395
+    #   giant    58 -> 102    2000 -> 2000       1992 -> 2000
+    #
+    # Shaping ADDS 76-80% to the frontier prompt on both tasks, and on "giant"
+    # it saved nothing at all: the two arms are identical in completion tokens.
+    # That is the shape of the trade the goal needs to see, and it was invisible.
+    #
+    # Only printed when a shaped run actually sent a rewritten prompt -- when
+    # the shaper fell back, the two arms are the same text and a "delta" would
+    # be the lane's own drift. Absent counts are skipped, never zero-filled.
+    def _sum(cond, key):
+        vals = [r.get(key) for r in results["runs"]
+                if r.get("condition") == cond and isinstance(r.get(key), int)]
+        return sum(vals) if vals else None
+
+    if applied:
+        pin, psh = _sum("raw", "prompt_tokens"), _sum("shaped", "prompt_tokens")
+        cin, csh = _sum("raw", "completion_tokens"), _sum("shaped", "completion_tokens")
+        if pin is not None and psh is not None:
+            print(f"\nfrontier prompt tokens: raw {pin} -> shaped {psh} "
+                  f"({psh - pin:+d}) -- shaping ADDS this to every dispatch")
+        if cin is not None and csh is not None:
+            print(f"frontier completion tokens: raw {cin} -> shaped {csh} "
+                  f"({csh - cin:+d})")
+        if None not in (pin, psh, cin, csh):
+            net = (psh + csh) - (pin + cin)
+            print(f"frontier tokens in total: raw {pin + cin} -> shaped "
+                  f"{psh + csh} ({net:+d})")
     print(f"\nwrote {args.out}")
     return 0
 
