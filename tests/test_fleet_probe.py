@@ -94,8 +94,20 @@ def test_probe_reports_a_down_lane_without_raising():
     row = fleet_probe.probe("dead", f"http://127.0.0.1:{_dead_port()}", "ollama",
                             timeout=1.0)
     assert row["reachable"] is False
-    assert row["model_count"] == 0
-    assert row["error"], "a down lane must say why, not just report zero"
+    # None, NOT 0, since 2026-12-03. This assertion used to read
+    # `row["model_count"] == 0`, and that pinned the DEFECT: a lane that could
+    # not answer the listing question at all reported the same figure as a live
+    # lane that answered "I have nothing installed". The sentence beside it --
+    # "a down lane must say why, not just report zero" -- named the right rule
+    # and then asserted the opposite of it on the line above. The rule the rest
+    # of the module already follows is list_models()'s: None where the lane
+    # cannot answer, [] where it answered nothing. A guard for a down lane must
+    # not certify a fabricated zero while telling the reader it refused one.
+    assert row["model_count"] is None, (
+        "a down lane cannot know how many models are installed, so it must "
+        "report unknown rather than a measured zero: %r" % (row["model_count"],))
+    assert row["models"] is None, row["models"]
+    assert row["error"], "a down lane must say why, not just report nothing"
 
 
 def test_control_up_and_down_are_distinguishable():

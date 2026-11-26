@@ -166,6 +166,16 @@ def key_env_name(label):
     return LANE_KEY_ENV_PREFIX + slug
 
 
+HOSTED_KINDS = ("openai",)
+"""Kinds that are a HOSTED portal rather than a local daemon.
+
+A hosted portal has no residency notion at all: there is no /api/ps to answer,
+so "is a model loaded on it" is not a question that applies. A LOCAL daemon that
+could not be reached reaches the same all-None row shape for the opposite
+reason. `reachable` and this tuple are what keep the two apart.
+"""
+
+
 def key_for(label):
     """(key, source_var) for a lane; (None, None) when nothing is configured.
 
@@ -394,6 +404,29 @@ def host_capacity(rows):
     """
     by_host = {}
     for r in rows:
+        # A HOSTED lane has no residency notion (`resident` and
+        # `resident_error` both None because the question does not apply). A
+        # DOWN lane reaches the same two Nones for the opposite reason: nothing
+        # was read because nothing answered. MEASURED 2026-12-03 at 297081a --
+        # this one predicate collapsed both, so a local lane that never
+        # responded was skipped as if it were hosted and its host appeared in
+        # NO line of the report: not free, not shared, not unread.
+        #
+        # `reachable` is the field that separates them, and it is the right one:
+        # it is False exactly when the probe could not get an answer, which is
+        # the fact being reported.
+        # A HOSTED portal is never local capacity, whether it answered or not.
+        # Checked BEFORE the unreachable branch: nous timing out is a hosted
+        # lane in trouble, not a local daemon whose residence could not be
+        # established, and reporting it as the latter would name a local host
+        # that does not exist.
+        if r.get("kind") in HOSTED_KINDS:
+            continue
+        if not r["reachable"]:
+            # Not asked -> the host's capacity is UNKNOWN, which is the
+            # `unread_hosts` bucket below, not silence.
+            by_host.setdefault(_host_of(r["url"]), []).append(r)
+            continue
         if r["resident"] is None and r["resident_error"] is None:
             continue  # hosted: no residency notion, not part of local capacity
         by_host.setdefault(_host_of(r["url"]), []).append(r)
@@ -442,6 +475,10 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
         return {
             "lane": label,
             "url": base_url,
+            # The lane KIND travels on the row so a consumer can tell a hosted
+            # portal from a local daemon without re-reading LANES -- and so it
+            # can do that on a DOWN lane, where residency says nothing.
+            "kind": kind,
             "reachable": True,
             "models": models,
             "model_count": None if models is None else len(models),
@@ -465,15 +502,35 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
         return {
             "lane": label,
             "url": base_url,
+            "kind": kind,
             "reachable": False,
-            "models": [],
-            "model_count": 0,
+            # None, NOT []. A down lane could not answer the listing question at
+            # all, so it does not know that nothing is installed. MEASURED
+            # 2026-12-03 at 297081a: probe() against a closed port and probe()
+            # against a live server answering {"models": []} produced
+            # BYTE-IDENTICAL models/model_count -- both []/0 -- so `--json`, the
+            # machine-readable surface, could not tell a dead lane from an empty
+            # live one. The human renderer was safe only because it prints
+            # r["error"] and `continue`s before touching these keys; the JSON
+            # consumer has no such guard.
+            # This is the contract list_models() already documents: "Returns
+            # None where the lane CANNOT answer the question, which is different
+            # from [] (it answered, nothing installed)". The failure path was
+            # the one branch that broke the module's own stated rule.
+            "models": None,
+            "model_count": None,
             "resident": None,
             "resident_count": None,
             "serving": None,
             "resident_error": None,
             "slots": None,
             "slots_error": None,
+            # Carried on the down row too, so the row schema does not depend on
+            # whether the lane happened to answer. MEASURED 2026-12-03: this key
+            # was present on every up row and ABSENT on every down row, so a
+            # consumer did `row["slots_cause"]` and got a KeyError on exactly the
+            # lanes it most needed to explain.
+            "slots_cause": None,
             "slot_ctx": None,
             "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
@@ -543,8 +600,19 @@ def main(argv):
     # the denominator from `resident is not None` dropped the second kind, so a
     # local lane that answered /api/ps and then failed rendered as if it were
     # not in the fleet -- the count got SMALLER and HEALTHIER than the truth.
+    # A lane that never answered is a LOCAL lane whose residency could not be
+    # established -- not an absent lane. MEASURED 2026-12-03 at 297081a: with
+    # the predicate below, a fleet of one live hosted lane plus two dead local
+    # lanes produced no local-capacity line at all, because `local` came out
+    # empty and the whole host block is nested in `if local:`. The fleet read
+    # smaller and healthier than the truth, which is the expensive direction
+    # for a report whose job is to keep work off billed lanes.
+    # Hosted portals are excluded by KIND rather than by the all-None shape,
+    # because a down lane wears that same shape.
     local = [r for r in rows
-             if r["resident"] is not None or r["resident_error"] is not None]
+             if r.get("kind") not in HOSTED_KINDS
+             and (r["resident"] is not None or r["resident_error"] is not None
+                  or not r["reachable"])]
     idle = [r for r in local if r["resident"] is not None and not r["serving"]]
     unread = [r for r in local if r["resident"] is None]
     if local:
