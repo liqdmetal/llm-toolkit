@@ -38,6 +38,24 @@ ENDPOINT = os.environ.get("AB_ENDPOINT", "http://127.0.0.1:8099/v1/chat/completi
 MODEL = os.environ.get("AB_MODEL", "z-ai/glm-5.3-flashx")
 
 
+# Loopback ports this fleet can PLACE, split by what the placement claims.
+#
+# These are two tables and not one list because they answer two different
+# questions. LOCAL means "this is one of our cards, the work was free". HOSTED
+# means "this is the hosted proxy, the work was billed". A port in neither table
+# is UNPLACED, and an unplaced port must not be silently folded into either.
+#
+# MEASURED 2026-12-02 against the endpoints this fleet actually runs:
+#   127.0.0.1:8099    nous portal             -> hosted   (correct)
+#   127.0.0.1:8081    q38 5090 tunnel         -> local    (correct)
+#   127.0.0.1:11434   3090 ollama tunnel      -> local    (correct)
+#   127.0.0.1:18082   defiant tunnel          -> local    (correct)
+#   127.0.0.1:8090    3090 llama.cpp tunnel   -> HOSTED   (WRONG: a local card)
+#   127.0.0.1:11448   q38 alt tunnel          -> HOSTED   (WRONG: a local card)
+LOCAL_LOOPBACK_PORTS = frozenset({8081, 11434, 18082})
+HOSTED_LOOPBACK_PORTS = frozenset({8099})
+
+
 def _is_hosted(endpoint: str) -> bool:
     """Does this endpoint name a HOSTED lane rather than a local GPU?
 
@@ -53,7 +71,7 @@ def _is_hosted(endpoint: str) -> bool:
         # A loopback port is a tunnel worth resolving, not a verdict by itself;
         # the two tunnel ports this fleet uses both land on local cards.
         port = urllib.parse.urlsplit(endpoint).port
-        return port not in (18082, 8081, 11434)
+        return port not in LOCAL_LOOPBACK_PORTS
     for local in ("192.168.1.124", "192.168.1.232"):
         if host == local:
             return False
@@ -83,7 +101,47 @@ def _lane_kind(endpoint: str) -> str:
         return "unknown"
     if not parts.hostname:
         return "unknown"
+    if parts.hostname in ("127.0.0.1", "localhost", "::1"):
+        # A LOOPBACK PORT IS A TUNNEL, NOT A LANE. The address alone cannot
+        # separate a local card's tunnel from a billed proxy's tunnel, so the
+        # port must be placed against a table -- and a port in neither table is
+        # unplaced, not hosted.
+        #
+        # MEASURED before this branch existed: 127.0.0.1:8090 (the 3090's
+        # llama.cpp) and 127.0.0.1:11448 (a q38 tunnel) both returned "hosted",
+        # so a sweep run entirely on our own cards printed
+        #   "all N run(s) went to a HOSTED lane; 0 local GPU(s) used"
+        # -- a false SPEND CLAIM about work that cost nothing, on the one line
+        # the DISTRIBUTE goal is read from. The old code got here by asking the
+        # two-valued "is it NOT ours" question and printing its answer as if it
+        # had settled "whose card was it".
+        port = parts.port
+        if port in LOCAL_LOOPBACK_PORTS:
+            return "local"
+        if port in HOSTED_LOOPBACK_PORTS:
+            return "hosted"
+        return "unknown"
     return "hosted" if _is_hosted(endpoint) else "local"
+
+
+def _unplaced_loopback_port(endpoint):
+    """The loopback port a summary could not place, or None.
+
+    The summary must be able to name WHICH port to add to the table; "no
+    endpoint was recorded" over an endpoint that is right there sends a reader
+    looking for a missing field instead of a missing table entry.
+    """
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        return None
+    try:
+        parts = urllib.parse.urlsplit(endpoint)
+    except ValueError:
+        return None
+    if parts.hostname in ("127.0.0.1", "localhost", "::1"):
+        if parts.port not in LOCAL_LOOPBACK_PORTS and \
+                parts.port not in HOSTED_LOOPBACK_PORTS:
+            return parts.port
+    return None
 # Budget chosen from a measurement, not preference (2026-11-27, 127.0.0.1:8099,
 # z-ai/glm-5.3-flashx, this file's own task text, one call per budget):
 #   budget  finish  content  reasoning  ctoks
@@ -457,8 +515,19 @@ def main() -> int:
     lane = _lane_kind(endpoint)
     total = len(results["runs"])
     if lane == "unknown":
-        print(f"{total} run(s): LANE UNKNOWN -- no endpoint was recorded ({endpoint!r}),"
-              f" so this file cannot say whether any local GPU was used")
+        # TWO causes, not one. An absent endpoint and a loopback port missing
+        # from the placement tables are different problems with different fixes,
+        # and the old sentence named only the first.
+        unplaced = _unplaced_loopback_port(endpoint)
+        if unplaced is not None:
+            print(f"{total} run(s): LANE UNPLACED -- {endpoint!r} is a loopback "
+                  f"tunnel on port {unplaced}, which is in neither "
+                  f"LOCAL_LOOPBACK_PORTS nor HOSTED_LOOPBACK_PORTS, so this file "
+                  f"cannot say whether a local GPU was used or a billed lane was "
+                  f"charged")
+        else:
+            print(f"{total} run(s): LANE UNKNOWN -- no endpoint was recorded ({endpoint!r}),"
+                  f" so this file cannot say whether any local GPU was used")
     elif lane == "local":
         print(f"all {total} run(s) went to a LOCAL lane; 0 hosted call(s) used")
     else:
