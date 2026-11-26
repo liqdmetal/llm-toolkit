@@ -79,6 +79,8 @@ def _run(monkeypatch, tmp_path, capfd, endpoint):
 
     monkeypatch.setattr(nous_ab.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(shape, "shape", _rewrites)
+    monkeypatch.setattr(shape, "shape_with_usage",
+                        lambda task, *_a, **_kw: (shape.shape(task, *_a, **_kw), {}))
     monkeypatch.setattr(nous_ab, "OUT_DIR", tmp_path)
     # ENDPOINT is read inside main() from the module global, so this is the
     # one place the lane is decided.

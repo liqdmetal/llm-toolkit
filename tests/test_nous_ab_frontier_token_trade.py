@@ -85,6 +85,8 @@ def _run(monkeypatch, tmp_path, capfd, *, shaper, drop_prompt_tokens=False):
 
     monkeypatch.setattr(nous_ab.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(shape, "shape", shaper)
+    monkeypatch.setattr(shape, "shape_with_usage",
+                        lambda task, *_a, **_kw: (shape.shape(task, *_a, **_kw), {}))
     monkeypatch.setattr(nous_ab, "OUT_DIR", tmp_path)
     out = tmp_path / "ab.json"
     monkeypatch.setattr(sys, "argv", ["nous_ab.py", "--out", str(out)])

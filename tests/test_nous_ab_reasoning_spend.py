@@ -87,6 +87,8 @@ def _run(monkeypatch, tmp_path, capfd, body):
     # fallback that would add its own lines to the output under test.
     monkeypatch.setattr(shape, "shape",
                         lambda task, *_a, **_kw: "REWRITTEN: " + task)
+    monkeypatch.setattr(shape, "shape_with_usage",
+                        lambda task, *_a, **_kw: (shape.shape(task, *_a, **_kw), {}))
     monkeypatch.setattr(nous_ab, "OUT_DIR", tmp_path)
     out = tmp_path / "ab.json"
     monkeypatch.setattr(sys, "argv", ["nous_ab.py", "--out", str(out)])

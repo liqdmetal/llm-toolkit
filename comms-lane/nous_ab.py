@@ -224,6 +224,11 @@ def main() -> int:
             note = ""
             shaped_ok = False
             shaping_wall_s = None
+            # Only the shaped arm dispatches to the shaper, but every run record
+            # carries the shaper's counts so a raw run and a shaped run are the
+            # same shape. Initialised here, outside the branch, because reading
+            # it below without a value is an UnboundLocalError on the raw arm.
+            shaper_usage = {}
             if cond == "shaped":
                 # Time the shaping step itself. MEASURED 2026-11-28: a shaper
                 # whose listed model cannot be loaded costs 3.5-5.6 s per
@@ -233,10 +238,17 @@ def main() -> int:
                 # frontier call only.
                 _t_sh = time.perf_counter()
                 try:
-                    s = shape.shape(text)
+                    # shape() is the wrapper that DISCARDS the usage dict, and
+                    # this harness is the only caller of the shaper in this
+                    # repo. Using it meant the shaper's own token spend -- the
+                    # half of the trade that shaping ADDS -- was unmeasurable,
+                    # which is the exact gap shape_with_usage() was written to
+                    # close. Flattening it back to a string re-opened the gap.
+                    s, shaper_usage = shape.shape_with_usage(text)
                 except Exception as e:
                     note = f"shaper-fail-fallback-raw: {e}"
                     s = ""
+                    shaper_usage = {}
                 if s:
                     text = s
                     note = f"shaped {len(s)}c"
@@ -246,10 +258,17 @@ def main() -> int:
                 shaping_wall_s = round(time.perf_counter() - _t_sh, 3)
             out_path = OUT_DIR / f"nous-{task['name']}-{cond}.json"
             r = call(text, out_path)
+            # Only what the shaper actually reported. An absent count stays
+            # absent (None) rather than being zero-filled: a shaper that could
+            # not be reached spent nothing and must not read as a measured 0.
             r.update(name=task["name"], condition=cond,
                      task_label=task["label"], prompt_chars=len(text),
                      note=note, shaped_applied=shaped_ok,
-                     shaping_wall_s=shaping_wall_s)
+                     shaping_wall_s=shaping_wall_s,
+                     shaper_prompt_tokens=shaper_usage.get("prompt_tokens"),
+                     shaper_completion_tokens=shaper_usage.get("completion_tokens"),
+                     shaper_expansion_x=shaper_usage.get("expansion_x"),
+                     shaper_usage_basis=shaper_usage.get("basis"))
             results["runs"].append(r)
             print(f"[{task['name']}/{cond}] {r['status']} "
                   f"finish={r.get('finish')} wall={r['wall_s']}s "
@@ -381,6 +400,38 @@ def main() -> int:
             net = (psh + csh) - (pin + cin)
             print(f"frontier tokens in total: raw {pin + cin} -> shaped "
                   f"{psh + csh} ({net:+d})")
+
+    # THE OTHER SIDE OF THE TRADE. `shape_with_usage()` exists so a caller can
+    # read what the shaper spends; until this line existed the harness called
+    # the wrapper that discards it, so a "decrease token usage" report could
+    # only see the frontier side. Shaping ADDS prompt tokens to save completion
+    # tokens (the measured rewrite is 3.13x the input's chars), so a one-sided
+    # report can only ever flatter it.
+    sh_in = [r["shaper_prompt_tokens"] for r in applied
+             if isinstance(r.get("shaper_prompt_tokens"), int)]
+    sh_out = [r["shaper_completion_tokens"] for r in applied
+              if isinstance(r.get("shaper_completion_tokens"), int)]
+    expansions = [r["shaper_expansion_x"] for r in applied
+                  if isinstance(r.get("shaper_expansion_x"), (int, float))]
+    if applied:
+        if sh_in or sh_out:
+            said = []
+            if sh_in:
+                said.append(f"{sum(sh_in)} prompt tokens in")
+            if sh_out:
+                said.append(f"{sum(sh_out)} completion tokens out")
+            over = f" over {len(applied)} shaping dispatch(es)"
+            print(f"\nshaper tokens: {' + '.join(said)}{over} -- paid on the "
+                  f"3090, invisible to the frontier count above")
+        else:
+            # A shaper that answered with no token counts is not a zero spend.
+            print(f"\nshaper tokens: NOT REPORTED for {len(applied)} "
+                  f"dispatch(es) -- the shaper returned no usage, so its spend "
+                  f"is unknown rather than zero")
+        if expansions:
+            print(f"shaper expansion: {sum(expansions) / len(expansions):.2f}x "
+                  f"the task's characters, so shaping ADDS prompt tokens to "
+                  f"save completion tokens")
     # WHERE THE WORK WENT. `endpoint` was written into every result file and
     # read NOWHERE in this repo, so the summary named the model and never the
     # lane. Measured 2026-11-28 over the four saved A/B files on disk: 13 runs,
