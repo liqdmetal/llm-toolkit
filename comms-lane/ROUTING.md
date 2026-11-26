@@ -30,9 +30,9 @@ is this file's own expensive direction.
 | Lane | State | Models |
 |---|---|---|
 | nous portal `127.0.0.1:8099` | UP, hosted, 0.7 s | 409 |
-| 5090 ollama `192.168.1.232:11434` | UP, idle 0/3 loaded | 3: `7b-qwen-q4`, `qwen2.5:7b`, `llama3.2-vision` |
+| 5090 ollama `192.168.1.232:11434` | UP, daemon idle 0/3 — **host SERVING** (q38 holds a model), so capacity NOT established | 3: `7b-qwen-q4`, `qwen2.5:7b`, `llama3.2-vision` |
 | q38 llama.cpp `192.168.1.232:8081` | UP, SERVING 1, slots unreadable (no key) | not listed by `/v1/models` |
-| 3090 ollama `192.168.1.124:11434` | UP, idle 0/7 loaded | 7, incl. `defiant9b-abliterated:256k` |
+| 3090 ollama `192.168.1.124:11434` | UP, daemon idle 0/7 — **host SERVING** (Inkling + defiant-vision hold the card), so capacity NOT established | 7, incl. `defiant9b-abliterated:256k` |
 | 3090-inkling `127.0.0.1:18082` | UP, SERVING 1, slots unreadable (no key) | not listed |
 | 3090-defiant `127.0.0.1:8090` | UP, SERVING 1, **0/4 slots busy** | `defiant-vision.gguf` |
 
