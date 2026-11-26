@@ -246,20 +246,74 @@ def read_slots(base_url, kind, timeout=TIMEOUT, key=None):
     ask", and the caller must render it as unknown rather than as a measured
     zero. Raising is how this function says so; the caller decides the wording.
     """
+    slots, _ctx = read_slot_state(base_url, kind, timeout, key)
+    return slots
+
+
+#: The smallest context any slot offers, or None when the server stated none.
+#: Named so the render path has one place to ask instead of reading the row key
+#: ad hoc in three of them.
+def _ctx_suffix(row):
+    """`", n_ctx <N>"` when this lane's context was MEASURED, else nothing.
+
+    WHY THE SUMMARY LINES NEED THIS, measured 2026-12-02: `fleet_probe` printed
+
+        [1] loaded local server(s) with every slot free (MEASURED spare
+            capacity: 3090-defiant 0/4)
+
+    and that one certified-free lane answered `/slots` with `n_ctx=4096` on all
+    four slots, while `shape.py`'s default shaper model is
+    `defiant9b-abliterated:256k` -- 262,144 tokens. So the ONLY lane in the
+    fleet whose busy count is readable was certified as spare capacity while
+    being 64x too small to hold the policy's own default prompt. A router that
+    trusted the line would send the work, hit a context-exceeded failure, and
+    fall through to the billed frontier lane -- the exact outcome this probe
+    exists to prevent, arrived at THROUGH the probe's own certificate. The
+    number was not wrong; it was incomplete.
+
+    An unstated `n_ctx` prints nothing at all. Absent is not 4096 and not 0: a
+    server that does not say must not be given a figure, or the field becomes a
+    guess on the two lanes whose `/slots` is key-gated and on any server run
+    with an older build that omits the key.
+    """
+    ctx = row.get("slot_ctx")
+    return "" if ctx is None else ", n_ctx %d" % ctx
+
+
+def read_slot_state(base_url, kind, timeout=TIMEOUT, key=None):
+    """One `/slots` read -> ``((total, busy), slot_ctx)``.
+
+    `read_slots` is kept as the `(total, busy)` shorthand every existing caller
+    and test uses; this is the same single HTTP read with the context carried
+    instead of discarded. One read, not two: probing must never perturb what it
+    measures, and two reads of a live server can disagree with each other.
+
+    `slot_ctx` is the SMALLEST `n_ctx` across slots, because llama.cpp assigns a
+    request to whichever slot is free -- so the context a caller can actually
+    rely on is the least any slot offers. Reporting the largest would certify
+    capacity that a prompt can still fail to fit inside. The aggregate is a
+    choice, and a silent choice is how a figure turns into an unfalsifiable
+    claim, so the basis is stated here rather than left to the reader.
+    """
     if kind != "llamacpp":
-        return None
+        return None, None
     base = base_url.rstrip("/")
     doc = _get(base + "/slots", timeout, key)
     if not isinstance(doc, list):
         raise ValueError("/slots answered %s, not a list" % type(doc).__name__)
     busy = 0
+    contexts = []
     for slot in doc:
+        if not isinstance(slot, dict):
+            continue
         # A slot mid-prefill or mid-decode both count as busy; only a truly
         # free slot is capacity.
-        if isinstance(slot, dict) and (
-                slot.get("is_processing") or slot.get("is_processing_prompt")):
+        if slot.get("is_processing") or slot.get("is_processing_prompt"):
             busy += 1
-    return len(doc), busy
+        n_ctx = slot.get("n_ctx")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            contexts.append(n_ctx)
+    return (len(doc), busy), (min(contexts) if contexts else None)
 
 
 def _host_of(url):
@@ -334,11 +388,12 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
                 ValueError, KeyError) as exc:
             resident, resident_error = None, "%s: %s" % (type(exc).__name__, exc)
         try:
-            slots = read_slots(base_url, kind, timeout, key)
+            slots, slot_ctx = read_slot_state(base_url, kind, timeout, key)
             slots_error = None
         except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                 ValueError, KeyError) as exc:
-            slots, slots_error = None, "%s: %s" % (type(exc).__name__, exc)
+            slots, slot_ctx, slots_error = None, None, \
+                "%s: %s" % (type(exc).__name__, exc)
         return {
             "lane": label,
             "url": base_url,
@@ -351,6 +406,7 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
             "resident_error": resident_error,
             "slots": slots,
             "slots_error": slots_error,
+            "slot_ctx": slot_ctx,
             "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
             "error": None,
@@ -369,6 +425,7 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
             "resident_error": None,
             "slots": None,
             "slots_error": None,
+            "slot_ctx": None,
             "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
             "error": "%s: %s" % (type(exc).__name__, exc),
@@ -467,7 +524,8 @@ def main(argv):
             print("[%d] loaded local server(s) with every slot free (MEASURED "
                   "spare capacity: %s)"
                   % (len(spare), ", ".join(
-                      "%s 0/%d" % (r["lane"], r["slots"][0]) for r in spare)))
+                      "%s 0/%d%s" % (r["lane"], r["slots"][0],
+                                    _ctx_suffix(r)) for r in spare)))
         # PARTIAL capacity is capacity too. MEASURED 2026-11-29: a loaded
         # llama.cpp server answering (4, 1) -- three slots free, one busy --
         # matched NO line in this report, because the predicate above demands
@@ -484,9 +542,11 @@ def main(argv):
             print("[%d] loaded local server(s) with free slots (MEASURED "
                   "partial capacity: %s)"
                   % (len(partial), ", ".join(
-                      "%s %d/%d free" % (r["lane"],
-                                         r["slots"][0] - r["slots"][1],
-                                         r["slots"][0]) for r in partial)))
+                      "%s %d/%d free%s" % (r["lane"],
+                                           r["slots"][0] - r["slots"][1],
+                                           r["slots"][0],
+                                           _ctx_suffix(r))
+                      for r in partial)))
         gated = [r for r in local
                  if r.get("slots") is None and r.get("slots_error")
                  and r.get("serving")]
