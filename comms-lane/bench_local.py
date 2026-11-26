@@ -58,14 +58,31 @@ def ollama_once(base, model):
     d = _post(url, {"model": model, "prompt": PROMPT, "stream": False,
                     "options": {"num_predict": NUM_PREDICT,
                                 "temperature": 0, "seed": 42}})
-    dec_n = d.get("eval_count") or 0
-    dec_s = (d.get("eval_duration") or 0) / 1e9
-    pre_n = d.get("prompt_eval_count") or 0
-    pre_s = (d.get("prompt_eval_duration") or 0) / 1e9
+    # A field the server did not send stays None. `or 0` here invented a
+    # MEASURED ZERO in the one column a reader is least able to check -- a
+    # SPEED. MEASURED 2026-12-02: a payload carrying eval_duration but no
+    # eval_count produced decode_tok_s 0.0 (0 tokens / the real duration),
+    # and the table prints a measured 0.0 as a number rather than a dash, so
+    # the receipt stated a speed the server never gave. A router reading that
+    # receipt skips a working lane and falls through to a billed one -- the
+    # exact outcome this stack exists to prevent, arrived at THROUGH the
+    # receipt. Same rule shape.py states for its usage dict and fleet_probe
+    # states for residency: absent is not zero.
+    dec_n = d.get("eval_count")
+    dec_d = d.get("eval_duration")
+    dec_s = (dec_d / 1e9) if dec_d else None
+    pre_n = d.get("prompt_eval_count")
+    pre_d = d.get("prompt_eval_duration")
+    pre_s = (pre_d / 1e9) if pre_d else None
+    load_d = d.get("load_duration")
     return {
-        "decode_tok_s": dec_n / dec_s if dec_s else None,
-        "prefill_tok_s": pre_n / pre_s if pre_s else None,
-        "load_s": (d.get("load_duration") or 0) / 1e9,
+        # A real 0 is a measurement: `is not None` on both sides, so an honest
+        # 0 tokens in 2.0 s still reports 0.0 tok/s.
+        "decode_tok_s": (dec_n / dec_s
+                        if (dec_n is not None and dec_s) else None),
+        "prefill_tok_s": (pre_n / pre_s
+                         if (pre_n is not None and pre_s) else None),
+        "load_s": (load_d / 1e9) if load_d is not None else None,
         "decode_tokens": dec_n,
         "prefill_tokens": pre_n,
     }
@@ -117,9 +134,13 @@ def openai_once(base, model):
                     "stream": False})
     elapsed = time.time() - started
     usage = d.get("usage") or {}
-    dec_n = usage.get("completion_tokens") or 0
+    # Same rule as ollama_once: a reply carrying no usage block reports an
+    # UNREPORTED completion count, never 0. MEASURED 2026-12-02: {"} ->
+    # decode_tokens 0.
+    dec_n = usage.get("completion_tokens")
     return {
-        "decode_tok_s": dec_n / elapsed if elapsed else None,
+        "decode_tok_s": (dec_n / elapsed
+                        if (dec_n is not None and elapsed) else None),
         "prefill_tok_s": None,
         "load_s": None,
         "decode_tokens": dec_n,
@@ -155,8 +176,20 @@ def measure(lane, reps):
     if error:
         row["error"] = error
         return row
-    dec = [s["decode_tok_s"] for s in samples if s.get("decode_tok_s")]
-    pre = [s["prefill_tok_s"] for s in samples if s.get("prefill_tok_s")]
+    # `is not None`, not truthiness: a REAL 0.0 tok/s is a measurement, and
+    # `if s.get(...)` filtered it out as falsy. MEASURED 2026-12-02: a server
+    # reporting eval_count 0 over a real 2.0 s duration produced samples of
+    # 0.0 and the row came back with NO decode_tok_s at all, rendering as the
+    # same dash a lane that was never measured renders as. The renderer below
+    # deliberately keeps a measured-zero branch ("a measured 0.0 tok/s is a
+    # measurement and must not render as the same dash a missing sample
+    # renders as") -- this filter made that branch unreachable. Two defects,
+    # one thumb: the absent count was promoted to a measured 0.0, and the
+    # real measured 0.0 was demoted to absent.
+    dec = [s["decode_tok_s"] for s in samples
+           if s.get("decode_tok_s") is not None]
+    pre = [s["prefill_tok_s"] for s in samples
+           if s.get("prefill_tok_s") is not None]
     if dec:
         row["decode_tok_s"] = statistics.median(dec)
         row["decode_min"] = min(dec)
