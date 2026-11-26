@@ -454,14 +454,39 @@ def main(argv):
         # cannot fail to load the way the host line warns about. Only lanes
         # whose /slots was actually READ appear here; a key-gated lane is not
         # counted as full, and not counted as free either.
+        # `serving` is load-bearing here, not decoration. MEASURED 2026-11-29:
+        # a server answering /health 503 (still loading) also answers /slots
+        # 200 with every slot free, so this line announced "every slot free"
+        # for a server that could not yet take a single request -- the
+        # overstatement in the same direction as the missing partial line, and
+        # the reason both arms of this predicate are pinned.
         spare = [r for r in local
-                 if r.get("slots") is not None and r["slots"][0] > 0
-                 and r["slots"][1] == 0]
+                 if r.get("slots") is not None and r.get("serving")
+                 and r["slots"][0] > 0 and r["slots"][1] == 0]
         if spare:
             print("[%d] loaded local server(s) with every slot free (MEASURED "
                   "spare capacity: %s)"
                   % (len(spare), ", ".join(
                       "%s 0/%d" % (r["lane"], r["slots"][0]) for r in spare)))
+        # PARTIAL capacity is capacity too. MEASURED 2026-11-29: a loaded
+        # llama.cpp server answering (4, 1) -- three slots free, one busy --
+        # matched NO line in this report, because the predicate above demands
+        # EVERY slot free. To a router the summary then reads identically to a
+        # saturated server, which is precisely the fall-through to a billed
+        # lane this tool exists to prevent. The model is resident either way,
+        # so a partial server carries the same guarantee the all-free line is
+        # built on: it cannot fail to load. Only lanes whose /slots was READ
+        # appear here; a 401 lane is neither partial nor full.
+        partial = [r for r in local
+                   if r.get("slots") is not None and r.get("serving")
+                   and r["slots"][0] - r["slots"][1] > 0 and r["slots"][1] > 0]
+        if partial:
+            print("[%d] loaded local server(s) with free slots (MEASURED "
+                  "partial capacity: %s)"
+                  % (len(partial), ", ".join(
+                      "%s %d/%d free" % (r["lane"],
+                                         r["slots"][0] - r["slots"][1],
+                                         r["slots"][0]) for r in partial)))
         gated = [r for r in local
                  if r.get("slots") is None and r.get("slots_error")
                  and r.get("serving")]
