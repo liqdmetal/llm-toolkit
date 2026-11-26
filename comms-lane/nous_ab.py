@@ -124,6 +124,72 @@ def _lane_kind(endpoint: str) -> str:
     return "hosted" if _is_hosted(endpoint) else "local"
 
 
+#: The statuses `call()` returns for a run whose REQUEST COMPLETED.
+#:
+#: A run carrying any other status never got an answer -- `call()` writes
+#: `status="ERROR"` and nothing else when the request itself raised. Such a run
+#: is evidence about the lane's AVAILABILITY, not about which lane took the
+#: work, and the DISTRIBUTE sentence must not count it as an arrival.
+ARRIVED_STATUSES = frozenset({"ANSWER", "REFUSE", "PARTIAL", "EMPTY",
+                              "TRUNCATED"})
+
+
+def _lane_arrivals(runs):
+    """Split run records: the ones that reached the endpoint, and the ones that did not.
+
+    MEASURED 2026-12-03 by driving main() with a dispatch that raises
+    ConnectionRefusedError, which is what a dead proxy looks like:
+
+      sweep                     printed
+      4 runs, 4 ERROR           all 4 run(s) went to a HOSTED lane; 0 local
+                               GPU(s) used        <- byte-identical to the
+                                                     clean sweep below
+      4 runs, 4 ANSWER          all 4 run(s) went to a HOSTED lane; 0 local
+                               GPU(s) used
+      0 runs                    all 0 run(s) went to a HOSTED lane
+
+    Two collapses on the one line the DISTRIBUTE goal is read from. (1) The
+    count was `len(results["runs"])` -- the number of attempts -- so a sweep in
+    which NOTHING reached the lane reported the lane's name and "0 local
+    GPU(s) used" as confidently as a sweep that worked, and a refused
+    connection read as a measured placement. (2) With no runs at all the line
+    still asserted a lane: "all 0 run(s)" is a claim about nothing, dressed as
+    a count.
+
+    Placement is a fact about the runs that ANSWERED. Everything else belongs
+    in an availability sentence, which is what `_arrival_causes` feeds.
+    """
+    arrived, missed = [], []
+    for r in runs or ():
+        status = r.get("status") if isinstance(r, dict) else None
+        (arrived if status in ARRIVED_STATUSES else missed).append(r)
+    return arrived, missed
+
+
+def _arrival_causes(missed):
+    """Why each missed run did not reach the lane, in order and de-duplicated.
+
+    "N run(s) failed" is the same fold one layer up: a refused connection, a
+    timeout and a run record with no status at all are three different problems
+    with three different fixes, and the summary has to be able to name which.
+    """
+    causes, seen = [], set()
+    for r in missed:
+        status = r.get("status") if isinstance(r, dict) else None
+        if status == "ERROR":
+            err = str(r.get("error") or "").strip().splitlines()
+            cause = "ERROR: " + err[0][:80] if err and err[0] else \
+                    "ERROR with no message"
+        elif status in (None, ""):
+            cause = "NO STATUS RECORDED"
+        else:
+            cause = repr(status)
+        if cause not in seen:
+            seen.add(cause)
+            causes.append(cause)
+    return causes
+
+
 def _unplaced_loopback_port(endpoint):
     """The loopback port a summary could not place, or None.
 
@@ -339,6 +405,17 @@ def main() -> int:
             # needed.
             print(f"  head: {r.get('head', '')!r}")
 
+    # Counted BEFORE the file is written, so the sentence an operator reads and
+    # the evidence a reader re-opens cannot disagree about how much of the
+    # sweep actually landed.
+    arrived, never_reached = _lane_arrivals(results["runs"])
+    results["lane_arrivals"] = {
+        "dispatched": len(results["runs"]),
+        "reached": len(arrived),
+        "never_reached": len(never_reached),
+        "never_reached_causes": _arrival_causes(never_reached),
+        "engaged_statuses": sorted(ARRIVED_STATUSES),
+    }
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"\n=== SUMMARY ({MODEL} @ {ENDPOINT}) ===")
     for task in TASKS:
@@ -512,26 +589,56 @@ def main() -> int:
     # sentence at all, because both branches required hosted != 0. So a sweep
     # to a card printed its endpoint and no count, and a sweep with
     # AB_ENDPOINT="" printed a full hosted sweep.
+    # WHICH RUNS THE LANE SENTENCE IS ABOUT. `total` used to be the number of
+    # ATTEMPTS, so a sweep in which nothing reached the endpoint still printed
+    # the lane's name and "0 local GPU(s) used" -- see _lane_arrivals for the
+    # three measured shapes. Placement is a fact about the runs that ANSWERED;
+    # a run that never arrived measures availability and is counted separately,
+    # out loud, before the placement sentence rather than folded into it.
     lane = _lane_kind(endpoint)
     total = len(results["runs"])
-    if lane == "unknown":
+    reached = len(arrived)
+    missed = len(never_reached)
+    causes = results["lane_arrivals"]["never_reached_causes"]
+    # THE ARRIVALS SENTENCE, FIRST. A reader who stops at the lane line must not
+    # read it as covering runs that never got an answer.
+    if missed and reached:
+        print(f"{missed}/{total} run(s) NEVER REACHED the endpoint "
+              f"({'; '.join(causes)}) -- those measure availability, not "
+              f"placement, so the lane sentence below covers only the "
+              f"{reached} that answered")
+    elif missed:
+        print(f"0 of {total} run(s) reached the endpoint ({'; '.join(causes)}) -- "
+              f"nothing answered, so this file cannot report a local GPU used "
+              f"or a billed call made. An unreachable endpoint is not a lane "
+              f"that took the work")
+    if total == 0:
+        # "all 0 run(s) went to a HOSTED lane" was a placement claim about a
+        # sweep that dispatched nothing. Nothing ran, so nothing is placed.
+        print("0 run(s): NOTHING WAS DISPATCHED -- this file records no run at "
+              "all, so it says nothing about which lane (if any) would have "
+              "taken the work")
+    elif not reached:
+        pass  # said in full by the arrivals sentence above; add no lane claim
+    elif lane == "unknown":
         # TWO causes, not one. An absent endpoint and a loopback port missing
         # from the placement tables are different problems with different fixes,
         # and the old sentence named only the first.
         unplaced = _unplaced_loopback_port(endpoint)
         if unplaced is not None:
-            print(f"{total} run(s): LANE UNPLACED -- {endpoint!r} is a loopback "
-                  f"tunnel on port {unplaced}, which is in neither "
+            print(f"{reached} run(s) answered: LANE UNPLACED -- {endpoint!r} is a "
+                  f"loopback tunnel on port {unplaced}, which is in neither "
                   f"LOCAL_LOOPBACK_PORTS nor HOSTED_LOOPBACK_PORTS, so this file "
                   f"cannot say whether a local GPU was used or a billed lane was "
                   f"charged")
         else:
-            print(f"{total} run(s): LANE UNKNOWN -- no endpoint was recorded ({endpoint!r}),"
-                  f" so this file cannot say whether any local GPU was used")
+            print(f"{reached} run(s) answered: LANE UNKNOWN -- no endpoint was "
+                  f"recorded ({endpoint!r}), so this file cannot say whether any "
+                  f"local GPU was used")
     elif lane == "local":
-        print(f"all {total} run(s) went to a LOCAL lane; 0 hosted call(s) used")
+        print(f"all {reached} run(s) went to a LOCAL lane; 0 hosted call(s) used")
     else:
-        print(f"all {total} run(s) went to a HOSTED lane; 0 local GPU(s) used")
+        print(f"all {reached} run(s) went to a HOSTED lane; 0 local GPU(s) used")
     return 0
 
 
