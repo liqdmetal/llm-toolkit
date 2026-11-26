@@ -78,9 +78,20 @@ def _run(monkeypatch, tmp_path, capfd, endpoint):
         return _Resp(BODY)
 
     monkeypatch.setattr(nous_ab.urllib.request, "urlopen", fake_urlopen)
+    # THE SHAPER IS DISABLED, deliberately. This harness is about the FRONTIER
+    # lane, and its fixtures used to stub shape_with_usage to REWRITE -- which
+    # means the shaper answered, and the shaper is defiant9b on 192.168.1.124:11434,
+    # one of our own cards. Every saved A/B file on disk records
+    # shaped_applied=0 (all four: ab-nous-qwen, ab-nous-results, ab-nous-solar,
+    # ab-results), so "12 of 12 hosted, 0 local" was measured over sweeps where
+    # shaping never ran. A stub that rewrites silently made the fixture a
+    # two-lane sweep while the arms below still asserted the one-lane sentence.
+    # Shaping now raises, which is the shape these arms actually describe.
+    def _no_shaper(*_a, **_kw):
+        raise RuntimeError("shaper unavailable (this harness tests the "
+                           "frontier lane only)")
     monkeypatch.setattr(shape, "shape", _rewrites)
-    monkeypatch.setattr(shape, "shape_with_usage",
-                        lambda task, *_a, **_kw: (shape.shape(task, *_a, **_kw), {}))
+    monkeypatch.setattr(shape, "shape_with_usage", _no_shaper)
     monkeypatch.setattr(nous_ab, "OUT_DIR", tmp_path)
     # ENDPOINT is read inside main() from the module global, so this is the
     # one place the lane is decided.

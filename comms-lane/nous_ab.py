@@ -416,6 +416,30 @@ def main() -> int:
         "never_reached_causes": _arrival_causes(never_reached),
         "engaged_statuses": sorted(ARRIVED_STATUSES),
     }
+    # THE SECOND LANE. The shaped arm dispatches to a model on ONE OF OUR CARDS
+    # before the frontier call, and that dispatch is work on a local GPU. The
+    # lane sentence below described only the FRONTIER endpoint, so a sweep that
+    # shaped every run and then called a billed proxy printed "0 local GPU(s)
+    # used" a few lines under "paid on the 3090". MEASURED 2026-12-03 by
+    # driving main() with the shaper stubbed to answer and the frontier stubbed
+    # to ANSWER:
+    #
+    #   shaper tokens: 474 prompt tokens in + 250 completion tokens out
+    #                  over 2 shaping dispatch(es) -- paid on the 3090,
+    #                  invisible to the frontier count above
+    #   endpoint: http://127.0.0.1:8099/v1/chat/completions
+    #   all 4 run(s) went to a HOSTED lane; 0 local GPU(s) used
+    #
+    # Two sentences in one report disagreeing about whether a card was used.
+    # Recorded here so the console and the evidence cannot disagree -- the same
+    # reason lane_arrivals is written before the file.
+    results["shaper"] = {
+        "endpoint": getattr(shape, "OLLAMA", None),
+        "model": getattr(shape, "MODEL", None),
+        "lane": _lane_kind(getattr(shape, "OLLAMA", None)),
+        "dispatches": len([r for r in results["runs"]
+                           if r.get("shaped_applied")]),
+    }
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"\n=== SUMMARY ({MODEL} @ {ENDPOINT}) ===")
     for task in TASKS:
@@ -556,8 +580,20 @@ def main() -> int:
             if sh_out:
                 said.append(f"{sum(sh_out)} completion tokens out")
             over = f" over {len(applied)} shaping dispatch(es)"
-            print(f"\nshaper tokens: {' + '.join(said)}{over} -- paid on the "
-                  f"3090, invisible to the frontier count above")
+            # WHICH CARD, named from the shaper's own endpoint -- not the string
+            # "the 3090", which was hardcoded and would keep saying it after the
+            # shaper was repointed. And "invisible to the frontier count above"
+            # is TRUE of the frontier arithmetic and FALSE as a statement about
+            # the whole report: the lane sentence below printed "0 local GPU(s)
+            # used" over the same sweep. Both sentences now read one recorded
+            # endpoint.
+            _sh_ep = getattr(shape, "OLLAMA", None)
+            _sh_lane = _lane_kind(_sh_ep)
+            _sh_where = (f"on the LOCAL lane {_sh_ep}"
+                         if _sh_lane == "local"
+                         else f"on a {_sh_lane.upper()} lane ({_sh_ep!r})")
+            print(f"\nshaper tokens: {' + '.join(said)}{over} -- paid {_sh_where}"
+                  f", NOT to the frontier endpoint above")
         else:
             # A shaper that answered with no token counts is not a zero spend.
             print(f"\nshaper tokens: NOT REPORTED for {len(applied)} "
@@ -636,9 +672,30 @@ def main() -> int:
                   f"recorded ({endpoint!r}), so this file cannot say whether any "
                   f"local GPU was used")
     elif lane == "local":
-        print(f"all {reached} run(s) went to a LOCAL lane; 0 hosted call(s) used")
+        print(f"all {reached} run(s) sent their FRONTIER call to a LOCAL lane; "
+              f"0 hosted call(s) used")
     else:
-        print(f"all {reached} run(s) went to a HOSTED lane; 0 local GPU(s) used")
+        # "0 local GPU(s) used" was a claim about the whole sweep computed from
+        # ONE endpoint. The shaped arm dispatches to a card BEFORE the frontier
+        # call, so a fully-shaped sweep to a billed proxy printed this a few
+        # lines under "paid on the 3090". The sentence now counts the shaper's
+        # dispatches and says which endpoint it is about.
+        sh = results.get("shaper") or {}
+        sh_n = sh.get("dispatches") or 0
+        sh_local = sh.get("lane") == "local"
+        if sh_n and sh_local:
+            print(f"all {reached} run(s) sent their FRONTIER call to a HOSTED "
+                  f"lane -- but the {sh_n} shaped run(s) dispatched to the "
+                  f"LOCAL card {sh.get('endpoint')} first, so this sweep DID "
+                  f"use a local GPU: {sh_n} local call(s), {reached} hosted")
+        elif sh_n:
+            print(f"all {reached} run(s) went to a HOSTED lane; 0 local GPU(s) "
+                  f"used by the frontier call, and the {sh_n} shaping "
+                  f"dispatch(es) also went to a non-local lane "
+                  f"({sh.get('lane')}, {sh.get('endpoint')!r})")
+        else:
+            print(f"all {reached} run(s) went to a HOSTED lane; 0 local GPU(s) "
+                  f"used, and no run was shaped")
     return 0
 
 

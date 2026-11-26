@@ -91,9 +91,14 @@ def _run(monkeypatch, tmp_path, capfd, endpoint):
         return _Resp(BODY)
 
     monkeypatch.setattr(nous_ab.urllib.request, "urlopen", fake_urlopen)
+    # Shaping disabled on purpose -- see the same note in
+    # test_nous_ab_lane_distribution.py. A rewrites-stub makes the shaper answer
+    # on one of our own cards (defiant9b, 192.168.1.124:11434), which turns the
+    # fixture into a two-lane sweep while these arms assert a one-lane sentence.
+    def _no_shaper(*_a, **_kw):
+        raise RuntimeError("shaper unavailable (frontier-lane harness)")
     monkeypatch.setattr(shape, "shape", _rewrites)
-    monkeypatch.setattr(shape, "shape_with_usage",
-                        lambda task, *_a, **_kw: (shape.shape(task, *_a, **_kw), {}))
+    monkeypatch.setattr(shape, "shape_with_usage", _no_shaper)
     monkeypatch.setattr(nous_ab, "OUT_DIR", tmp_path)
     monkeypatch.setattr(nous_ab, "ENDPOINT", endpoint)
     out = tmp_path / "ab.json"
