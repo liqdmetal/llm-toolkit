@@ -115,6 +115,51 @@ LANE_KEY_ENV = "FLEET_LANE_API_KEY"          # fallback for every lane
 LANE_KEY_ENV_PREFIX = "FLEET_LANE_API_KEY_"   # per-lane override
 
 
+# Why a `/slots` read failed, as distinct CAUSES. The report named one cause
+# for all of them and it was the wrong one in most arms. MEASURED 2026-12-03 by
+# driving the shipped `main()` over six error texts on one gated lane:
+#
+#     401 Unauthorized        -> "no API key configured; set FLEET_LANE_API_KEY_Q38"
+#     timeout                 -> the same sentence
+#     500 Internal Server Err -> the same sentence
+#     403 Forbidden           -> the same sentence
+#     200 but not a slot list -> the same sentence
+#     404 Not Found           -> the same sentence
+#
+# A key cannot fix a timeout, a 500, a missing endpoint or a payload of the
+# wrong SHAPE, and an operator who sets a variable because the report told them
+# to, reruns, and gets the identical sentence has been sent to fix a thing that
+# was never wrong. The report exists to say which action turns an unread figure
+# into a measurement, so it has to name the cause it ACTUALLY saw.
+SLOTS_CAUSE_AUTH = "auth"
+SLOTS_CAUSE_TIMEOUT = "timeout"
+SLOTS_CAUSE_HTTP = "http"
+SLOTS_CAUSE_SHAPE = "shape"
+SLOTS_CAUSE_UNREACHABLE = "unreachable"
+SLOTS_CAUSE_UNKNOWN = "unreadable"
+
+
+def slots_cause(err):
+    """Which cause a recorded `/slots` failure names.
+
+    Classified from the text `probe()` records (`"<Type>: <message>"`), because
+    the row shape is what every existing caller and test fixture speaks. An
+    unrecognised failure is `unreadable`, which claims nothing.
+    """
+    t = err or ""
+    if "401" in t or "403" in t or "Unauthorized" in t or "Forbidden" in t:
+        return SLOTS_CAUSE_AUTH
+    if "timed out" in t or "timeout" in t.lower():
+        return SLOTS_CAUSE_TIMEOUT
+    if "HTTP Error" in t or "HTTPError" in t:
+        return SLOTS_CAUSE_HTTP
+    if "not a list" in t or "ValueError" in t or "KeyError" in t:
+        return SLOTS_CAUSE_SHAPE
+    if "URLError" in t or "OSError" in t or "Connection" in t:
+        return SLOTS_CAUSE_UNREACHABLE
+    return SLOTS_CAUSE_UNKNOWN
+
+
 def key_env_name(label):
     """The environment variable that may hold an API key for this lane."""
     slug = "".join(c if c.isalnum() else "_" for c in label).upper()
@@ -406,6 +451,10 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
             "resident_error": resident_error,
             "slots": slots,
             "slots_error": slots_error,
+            # The cause travels WITH the row so the summary never has to
+            # re-guess it from a prose sentence, and so --json carries it too.
+            "slots_cause": (None if slots_error is None
+                            else slots_cause(slots_error)),
             "slot_ctx": slot_ctx,
             "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
@@ -567,15 +616,58 @@ def main(argv):
             # rendered identically. The second is the worse one to be silent
             # about: the operator has done the thing the report asked and the
             # report stops talking, which reads as success.
-            unnamed = [r["lane"] for r in gated if not r.get("key_source")]
-            refused = [r for r in gated if r.get("key_source")]
+            # EVERY LANE'S OWN KNOB, and only the cause that was measured.
+            # Two defects lived in the three lines this replaces:
+            #
+            # 1. It hinted `key_env_name(unnamed[0])` -- the FIRST unnamed lane
+            #    only. MEASURED 2026-12-03 with q38 and 3090-inkling both 401:
+            #    the line read "set FLEET_LANE_API_KEY_Q38 or FLEET_LANE_API_KEY"
+            #    while the second lane needs FLEET_LANE_API_KEY_3090_INKLING,
+            #    which appeared nowhere. The operator sets the one knob printed,
+            #    reruns, and 3090-inkling is still dark with the identical
+            #    sentence printed again -- the report asks for an action it
+            #    cannot accept.
+            # 2. It blamed the missing key for every failure. A timeout, a 500,
+            #    a 404 and a wrong-shaped payload all got the same sentence; see
+            #    the SLOTS_CAUSE_* block above for the six-arm measurement.
+            #
+            # Grouped by cause so a lane is never explained by a cause it did
+            # not have. `auth` is the only bucket where a key is the fix.
+            by_cause = {}
+            for r in gated:
+                c = r.get("slots_cause") or slots_cause(r.get("slots_error"))
+                by_cause.setdefault(c, []).append(r)
             hints = []
+            authrows = by_cause.pop(SLOTS_CAUSE_AUTH, [])
+            unnamed = [r["lane"] for r in authrows if not r.get("key_source")]
             if unnamed:
-                hints.append("no API key configured; set %s or %s"
-                             % (key_env_name(unnamed[0]), LANE_KEY_ENV))
-            for r in refused:
-                hints.append("%s sent %s and the server refused it"
-                             % (r["lane"], r["key_source"]))
+                # The PHRASE "no API key configured" is load-bearing: two
+                # sibling pins assert it, and it is TRUE for this bucket -- an
+                # auth refusal with no key set really is an unconfigured key.
+                # My first version replaced it and broke both, which is the
+                # over-broad-guard mistake in reverse: the fix widened the
+                # CAUSE analysis and needlessly changed wording that was right.
+                # Every unnamed lane's own knob, then the shared fallback.
+                knobs = ", ".join(key_env_name(l) for l in unnamed)
+                hints.append("no API key configured; set %s (or one shared %s)"
+                             % (knobs, LANE_KEY_ENV))
+            for r in authrows:
+                if r.get("key_source"):
+                    hints.append("%s sent %s and the server refused it"
+                                 % (r["lane"], r["key_source"]))
+            # Everything else is NOT a key problem, and saying so is the point:
+            # an operator must not be sent to set a variable that cannot help.
+            for cause, rs in sorted(by_cause.items()):
+                lanes = ", ".join(r["lane"] for r in rs)
+                why = {
+                    SLOTS_CAUSE_TIMEOUT: "the server did not answer /slots in time",
+                    SLOTS_CAUSE_HTTP: "the server answered /slots with an HTTP error",
+                    SLOTS_CAUSE_SHAPE: "the server answered /slots with a payload that is not a slot list",
+                    SLOTS_CAUSE_UNREACHABLE: "the server could not be reached",
+                    SLOTS_CAUSE_UNKNOWN: "the /slots read failed for an unrecognised reason",
+                }.get(cause, "the /slots read failed")
+                hints.append("%s: %s -- no API key fixes this (%s)"
+                             % (lanes, why, rs[0].get("slots_error")))
             hint = (" -- " + "; ".join(hints)) if hints else ""
             print("[%d] serving local lane(s) whose busy count could not be "
                   "read (not counted as free): %s%s"
