@@ -13,21 +13,45 @@ Pipeline: user/ops prompt -> `shape.py` (defiant9b-abliterated on the 3090,
 | Policy / terms / safety questions aimed AT the frontier model | Raw, unshaped. Do not shape policy questions — the answer must be the model's own. |
 | Anything with byte-exact verifier (miner kernels, gates, golden tests) | Route to forge/q38 and let the GATE decide truth, not the model. Shaping optional. |
 
-## Measured availability (2026-11-24, `fleet_probe.py`)
+## Measured availability (2026-11-29 run, `fleet_probe.py`)
 
 This row used to name "q38 jumbo, defiant abliterated, Qwen heretic on the 5090".
 Probed rather than assumed, that is wrong on all three counts: none of those names
 exist on the 5090, and the abliterated model lives on the 3090.
 
+The table below carries **every lane the roster measures**, because a lane with no
+row is a lane the policy does not route to. MEASURED 2026-11-29 at `237e5d2`: the
+three rows this table used to have described the lanes that were IDLE, and the
+three lanes it did not mention were the three SERVING — including the one lane
+with measured free slots (`3090-defiant`, 0/4 busy). A reader of this policy was
+therefore pointed away from the only lane with established spare capacity, which
+is this file's own expensive direction.
+
 | Lane | State | Models |
 |---|---|---|
-| nous portal `127.0.0.1:8099` | UP, 316 ms | 410 |
-| 5090 `192.168.1.232:11434` | UP, 18 ms | `7b-qwen-q4`, `qwen2.5:7b`, `llama3.2-vision` |
-| 3090 `192.168.1.124:11434` | UP, 17 ms | 7, incl. `defiant9b-abliterated:256k` |
+| nous portal `127.0.0.1:8099` | UP, hosted, 0.7 s | 409 |
+| 5090 ollama `192.168.1.232:11434` | UP, idle 0/3 loaded | 3: `7b-qwen-q4`, `qwen2.5:7b`, `llama3.2-vision` |
+| q38 llama.cpp `192.168.1.232:8081` | UP, SERVING 1, slots unreadable (no key) | not listed by `/v1/models` |
+| 3090 ollama `192.168.1.124:11434` | UP, idle 0/7 loaded | 7, incl. `defiant9b-abliterated:256k` |
+| 3090-inkling `127.0.0.1:18082` | UP, SERVING 1, slots unreadable (no key) | not listed |
+| 3090-defiant `127.0.0.1:8090` | UP, SERVING 1, **0/4 slots busy** | `defiant-vision.gguf` |
+
+The `127.0.0.1` rows are ssh tunnels to `192.168.1.124`; `host_capacity()` maps
+them to their far end so one card is not counted twice. Only `3090-defiant`
+reports a busy count, so it is the only lane whose spare capacity is ESTABLISHED;
+the two unreadable ones are "not counted as free", never "idle".
 
 Sensitive reasoning therefore routes to the **3090**, which holds
 `defiant9b-abliterated:256k` (what `shape.py` already defaults to). The 5090 is
 not a heretic box today; it holds small Qwen and a vision model.
+
+The latency figures live in the probe's output, not in this table. Two of them
+(`316 ms`, `410` models) were stale by this run — the same lanes measured 0.7 s
+and 409 — and a hard-coded millisecond in a policy document is a number no
+instrument reproduces once the fleet is re-probed. `tests/test_routing_lane_table_matches_roster.py`
+holds the table to the roster: every measured lane needs a row, no row may name a
+lane the roster does not measure, each row must state lane STATE and not only a
+speed, and this section must name the date its figures came from.
 
 DO NOT read an empty `/api/ps` as an idle MACHINE. The 5090's ollama answers
 `{"models":[]}` while `http://192.168.1.232:8081/health` — q38's llama.cpp
