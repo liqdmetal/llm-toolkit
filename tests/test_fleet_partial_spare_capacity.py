@@ -55,6 +55,13 @@ import fleet_probe  # noqa: E402
 
 PREFIX_FILE = "comms-lane/fleet_probe.py"
 
+# The commit that still HAS the defect. Pinned by sha, never read as ``HEAD``:
+# committing the fix moves HEAD onto the fixed tree, which leaves the control
+# nothing to fail on and turns it red for the wrong reason. That happened here --
+# suite red at e9fafb5 with ``the pre-fix tree already named partial capacity``,
+# which was HEAD talking about the commit that fixed it.
+PREFIX_SHA = "40c742438ac52d3dba17ea1d23e80b3cf7982337"
+
 
 # --------------------------------------------------------------------------
 # A llama.cpp-shaped server whose slot list the test sets directly. Class
@@ -216,7 +223,7 @@ def test_control_idle_lane_is_not_capacity(monkeypatch, llama):
 # NEGATIVE CONTROL: the pre-fix module, from the tip, imported on its own.
 # --------------------------------------------------------------------------
 def _prefix_module():
-    """Materialise ``fleet_probe`` from HEAD into its own directory.
+    """Materialise ``fleet_probe`` from the PRE-FIX sha into its own directory.
 
     The copy lives OUTSIDE the repo so ``sys.path`` cannot fall back to the
     fixed module -- an editable install or a cwd insert would otherwise let the
@@ -225,11 +232,18 @@ def _prefix_module():
     """
     import subprocess
     d = pathlib.Path(tempfile.mkdtemp(prefix="fleet-prefix-"))
-    src = subprocess.run(["git", "-C", str(ROOT), "show", "HEAD:" + PREFIX_FILE],
+    src = subprocess.run(["git", "-C", str(ROOT), "show", PREFIX_SHA + ":" + PREFIX_FILE],
                          capture_output=True, text=True, check=True).stdout
     (d / "fleet_probe.py").write_text(src, encoding="utf-8", newline="")
     spec = importlib.util.spec_from_file_location(
         "fleet_probe_prefix", d / "fleet_probe.py")
+    # The pinned tree must actually BE the pre-fix tree. If a rewrite, a
+    # rebase or a bad sha ever moved it onto the fixed side, every arm below
+    # would go red claiming the defect is present -- the failure this whole
+    # pin exists to stop being silent. Fail here instead, naming the cause.
+    assert "partial capacity" not in src, (
+        "PREFIX_SHA %s already contains the fix, so it is not the pre-fix tree "
+        "and every arm below would fail for the wrong reason" % PREFIX_SHA[:12])
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
