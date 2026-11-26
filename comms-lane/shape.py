@@ -325,6 +325,19 @@ def shape_with_usage(task: str, system: str = DEFAULT_SYSTEM,
     # A shaper that produced nothing still cost tokens. Say so rather than
     # returning an empty string that reads like a free no-op.
     usage["produced_text"] = bool(shaped.strip())
+    # `done_reason` is the ONLY field that says whether the model finished
+    # or ran out of room, and this file read it nowhere. Ollama answers
+    # "length" when generation stopped at the num_predict cap and "stop"
+    # when the model stopped on its own. Without it a rewrite cut at
+    # 4096 tokens was indistinguishable from a complete one: the caller
+    # saw a shorter prompt and applied it as the finished rewrite, so the
+    # frontier model was handed a truncated instruction that looked like a
+    # deliberated one. An ABSENT done_reason is not "complete" -- an older
+    # server or a proxy that strips the field cannot answer the question,
+    # so it stays absent rather than defaulting to False.
+    if "done_reason" in data:
+        usage["done_reason"] = data["done_reason"]
+        usage["truncated"] = data["done_reason"] == "length"
     return shaped, usage
 
 
