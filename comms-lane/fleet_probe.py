@@ -301,7 +301,7 @@ def read_slots(base_url, kind, timeout=TIMEOUT, key=None):
     ask", and the caller must render it as unknown rather than as a measured
     zero. Raising is how this function says so; the caller decides the wording.
     """
-    slots, _ctx = read_slot_state(base_url, kind, timeout, key)
+    slots, _ctx, _n = read_slot_state(base_url, kind, timeout, key)
     return slots
 
 
@@ -310,6 +310,23 @@ def read_slots(base_url, kind, timeout=TIMEOUT, key=None):
 #: ad hoc in three of them.
 def _ctx_suffix(row):
     """`", n_ctx <N>"` when this lane's context was MEASURED, else nothing.
+
+    COVERAGE, not just the figure. MEASURED 2026-12-03, driving
+    read_slot_state over five /slots documents: a 4-slot server where ONE slot
+    stated n_ctx=4096 produced the identical suffix to a server where all four
+    did -- `, n_ctx 4096`. The figure was a real reading; the sentence implied
+    it described the whole server. llama.cpp assigns a request to whichever slot
+    is free, so the context a caller can rely on is the least ANY slot offers,
+    and a min taken over one of four slots is a claim about that slot only. A
+    router told "n_ctx 4096" on a server whose other three slots were never
+    described has been told the measurement's value and not its scope, which is
+    the same defect class as the missing figure this function was written for:
+    a real number reported without the fact that decides whether it can be used.
+
+    A fully-covered server renders exactly as before, because that reading IS
+    complete and adding words to it would be noise on the common case. A partly
+    covered one says how many slots stated a context, so the number and its
+    scope travel together.
 
     WHY THE SUMMARY LINES NEED THIS, measured 2026-12-02: `fleet_probe` printed
 
@@ -332,11 +349,21 @@ def _ctx_suffix(row):
     with an older build that omits the key.
     """
     ctx = row.get("slot_ctx")
-    return "" if ctx is None else ", n_ctx %d" % ctx
+    if ctx is None:
+        return ""
+    covered = row.get("slot_ctx_slots")
+    slots = row.get("slots")
+    total = slots[0] if isinstance(slots, tuple) and slots else None
+    if covered is None or total is None or covered >= total:
+        # Fully covered, or the total is unknown -- in the second case there is
+        # no denominator to state, and inventing one would be a fabricated
+        # figure in the field that exists to stop fabricated figures.
+        return f", n_ctx {ctx}"
+    return f", n_ctx {ctx} ({covered} of {total} slots stated a context)"
 
 
 def read_slot_state(base_url, kind, timeout=TIMEOUT, key=None):
-    """One `/slots` read -> ``((total, busy), slot_ctx)``.
+    """One `/slots` read -> ``((total, busy), slot_ctx, ctx_slots)``.
 
     `read_slots` is kept as the `(total, busy)` shorthand every existing caller
     and test uses; this is the same single HTTP read with the context carried
@@ -349,9 +376,23 @@ def read_slot_state(base_url, kind, timeout=TIMEOUT, key=None):
     capacity that a prompt can still fail to fit inside. The aggregate is a
     choice, and a silent choice is how a figure turns into an unfalsifiable
     claim, so the basis is stated here rather than left to the reader.
+
+    `ctx_slots` is HOW MANY slots stated an `n_ctx` at all, because a minimum
+    over one slot and a minimum over four are different facts and the tuple
+    could not tell them apart. MEASURED 2026-12-03: one measured slot out of
+    four yielded the same ``slot_ctx`` as four measured slots. The count is
+    returned rather than folded into a boolean so a consumer can say "1 of 4"
+    instead of only "partial".
     """
     if kind != "llamacpp":
-        return None, None
+        # THREE values, not two. `(total, busy)` is N/A for an ollama lane and
+        # so is the coverage count -- but a two-value return in a
+        # three-value function raises ValueError at the unpack, and probe()'s
+        # except turns that into a slots_error: an ollama lane, whose /slots
+        # question does not apply, would report as an attempted-and-failed
+        # read. Caught by the both-trees control that pins N/A against error
+        # (tests/test_fleet_slots_are_not_residency.py).
+        return None, None, None
     base = base_url.rstrip("/")
     doc = _get(base + "/slots", timeout, key)
     if not isinstance(doc, list):
@@ -368,7 +409,8 @@ def read_slot_state(base_url, kind, timeout=TIMEOUT, key=None):
         n_ctx = slot.get("n_ctx")
         if isinstance(n_ctx, int) and n_ctx > 0:
             contexts.append(n_ctx)
-    return (len(doc), busy), (min(contexts) if contexts else None)
+    return ((len(doc), busy), (min(contexts) if contexts else None),
+            len(contexts))
 
 
 def _host_of(url):
@@ -466,11 +508,12 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
                 ValueError, KeyError) as exc:
             resident, resident_error = None, "%s: %s" % (type(exc).__name__, exc)
         try:
-            slots, slot_ctx = read_slot_state(base_url, kind, timeout, key)
+            slots, slot_ctx, slot_ctx_slots = read_slot_state(
+                base_url, kind, timeout, key)
             slots_error = None
         except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                 ValueError, KeyError) as exc:
-            slots, slot_ctx, slots_error = None, None, \
+            slots, slot_ctx, slot_ctx_slots, slots_error = None, None, None, \
                 "%s: %s" % (type(exc).__name__, exc)
         return {
             "lane": label,
@@ -493,6 +536,10 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
             "slots_cause": (None if slots_error is None
                             else slots_cause(slots_error)),
             "slot_ctx": slot_ctx,
+            # How many slots stated an n_ctx. The figure above is a min over
+            # these, so 1 and 4 describe very different servers. None when
+            # /slots was never read (a 401, a timeout) -- no read, no count.
+            "slot_ctx_slots": slot_ctx_slots,
             "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
             "error": None,
@@ -532,6 +579,7 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
             # lanes it most needed to explain.
             "slots_cause": None,
             "slot_ctx": None,
+            "slot_ctx_slots": None,
             "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
             "error": "%s: %s" % (type(exc).__name__, exc),
