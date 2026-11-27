@@ -566,20 +566,41 @@ def main() -> int:
     # only see the frontier side. Shaping ADDS prompt tokens to save completion
     # tokens (the measured rewrite is 3.13x the input's chars), so a one-sided
     # report can only ever flatter it.
-    sh_in = [r["shaper_prompt_tokens"] for r in applied
+    #
+    # SPEND IS PAID AT DISPATCH, NOT AT USE. MEASURED 2026-12-03 on this tree:
+    # these lists were built from `applied` -- the shaped runs whose rewrite the
+    # harness actually USED -- so a shaper that ran, spent 237+125 tokens per
+    # dispatch and returned no usable rewrite contributed NOTHING to the total.
+    # The summary then printed only
+    #
+    #     shaped arm NEVER SHAPED: 0/2 runs were rewritten
+    #
+    # which is true about the rewrite and silent about the money. A reader sees
+    # a sweep that spent nothing to learn nothing; the truth is a sweep that
+    # paid the full shaping bill for zero benefit, which is the worst shape of
+    # this trade and the one shape the report could not express. A dispatch is
+    # the unit that costs, so the spend sums run over EVERY shaped run.
+    # `applied` remains the right basis for EXPANSION only, because a run with
+    # no rewrite has no rewrite to measure.
+    sh_disp = shaped_runs
+    sh_in = [r["shaper_prompt_tokens"] for r in sh_disp
              if isinstance(r.get("shaper_prompt_tokens"), int)]
-    sh_out = [r["shaper_completion_tokens"] for r in applied
+    sh_out = [r["shaper_completion_tokens"] for r in sh_disp
               if isinstance(r.get("shaper_completion_tokens"), int)]
     expansions = [r["shaper_expansion_x"] for r in applied
                   if isinstance(r.get("shaper_expansion_x"), (int, float))]
-    if applied:
+    if sh_disp:
         if sh_in or sh_out:
             said = []
             if sh_in:
                 said.append(f"{sum(sh_in)} prompt tokens in")
             if sh_out:
                 said.append(f"{sum(sh_out)} completion tokens out")
-            over = f" over {len(applied)} shaping dispatch(es)"
+            # Count the dispatches that BOUGHT something, beside the ones that
+            # were paid for. "2 shaping dispatch(es)" alone would leave a
+            # zero-benefit sweep looking like a productive one.
+            over = (f" over {len(sh_disp)} shaping dispatch(es), "
+                    f"{len(applied)} of which produced a usable rewrite")
             # WHICH CARD, named from the shaper's own endpoint -- not the string
             # "the 3090", which was hardcoded and would keep saying it after the
             # shaper was repointed. And "invisible to the frontier count above"
@@ -594,7 +615,7 @@ def main() -> int:
                          else f"on a {_sh_lane.upper()} lane ({_sh_ep!r})")
             print(f"\nshaper tokens: {' + '.join(said)}{over} -- paid {_sh_where}"
                   f", NOT to the frontier endpoint above")
-        else:
+        elif applied:
             # A shaper that answered with no token counts is not a zero spend.
             print(f"\nshaper tokens: NOT REPORTED for {len(applied)} "
                   f"dispatch(es) -- the shaper returned no usage, so its spend "
