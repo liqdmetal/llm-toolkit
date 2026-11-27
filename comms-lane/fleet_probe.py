@@ -305,6 +305,76 @@ def read_slots(base_url, kind, timeout=TIMEOUT, key=None):
     return slots
 
 
+def read_slot_detail(base_url, kind, timeout=TIMEOUT, key=None):
+    """One `/slots` read -> every field the report needs, from ONE read.
+
+    Added because the report needs a fourth fact (`parked`) and the module's own
+    rule forbids getting it with a second read: "probing must never perturb what
+    it measures, and two reads of a live server can disagree with each other".
+    So this carries the three existing fields plus the new one out of the same
+    single HTTP GET, and `read_slot_state` stays a thin wrapper over it -- its
+    tuple shape is unchanged, which is what keeps the dozen existing callers and
+    their tests honest.
+
+    `parked` is the slots whose busy flag is CLEAR but which still hold a task:
+    an `id_task` the server has assigned, and prompt tokens it has ingested but
+    not advanced. MEASURED 2026-12-04 against the live fleet, nine reads over ~40
+    seconds of `3090-defiant` (127.0.0.1:8090), every read identical:
+
+        slot0-2  is_processing false, id_task None
+        slot3    is_processing false, id_task 158, n_prompt_tokens 19,
+                 n_prompt_tokens_processed 0
+
+    while `fleet_probe` printed `3090-defiant 0/4 ..., MEASURED spare capacity`.
+    That is the sharpest form of this repo's standing class: not a zero standing
+    in for an absence, but a MAXIMUM standing in for an unmeasured slot. The
+    busy flags say what a slot is doing; they do not say whether it is FREE, and
+    a slot holding an assigned task is not evidence of freedom.
+
+    It is deliberately NOT counted as busy. Whether that task is reserved work
+    about to prefill or state left behind by a finished one cannot be decided
+    from this document, and inventing either answer would be the same defect in
+    the opposite direction. It is reported as its own named state, so the spare
+    capacity figure and the fact that qualifies it travel together.
+
+    `id_task` is compared with `>= 0` rather than tested for presence: a build
+    that reports `-1` for an idle slot must not read as holding task 0.
+    """
+    if kind != "llamacpp":
+        # Same N/A discipline as read_slot_state: an ollama lane has no /slots
+        # notion at all, and that is not a failed read.
+        return {"slots": None, "slot_ctx": None, "slot_ctx_slots": None,
+                "parked": None}
+    base = base_url.rstrip("/")
+    doc = _get(base + "/slots", timeout, key)
+    if not isinstance(doc, list):
+        raise ValueError("/slots answered %s, not a list" % type(doc).__name__)
+    busy = 0
+    contexts = []
+    parked = []
+    for slot in doc:
+        if not isinstance(slot, dict):
+            continue
+        processing = bool(slot.get("is_processing")
+                          or slot.get("is_processing_prompt"))
+        if processing:
+            busy += 1
+        n_ctx = slot.get("n_ctx")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            contexts.append(n_ctx)
+        if not processing:
+            task = slot.get("id_task")
+            if isinstance(task, int) and task >= 0:
+                parked.append({"slot": slot.get("id"), "id_task": task,
+                               "prompt_tokens": slot.get("n_prompt_tokens"),
+                               "processed": slot.get(
+                                   "n_prompt_tokens_processed")})
+    return {"slots": (len(doc), busy),
+            "slot_ctx": min(contexts) if contexts else None,
+            "slot_ctx_slots": len(contexts),
+            "parked": parked}
+
+
 #: The smallest context any slot offers, or None when the server stated none.
 #: Named so the render path has one place to ask instead of reading the row key
 #: ad hoc in three of them.
@@ -393,24 +463,8 @@ def read_slot_state(base_url, kind, timeout=TIMEOUT, key=None):
         # read. Caught by the both-trees control that pins N/A against error
         # (tests/test_fleet_slots_are_not_residency.py).
         return None, None, None
-    base = base_url.rstrip("/")
-    doc = _get(base + "/slots", timeout, key)
-    if not isinstance(doc, list):
-        raise ValueError("/slots answered %s, not a list" % type(doc).__name__)
-    busy = 0
-    contexts = []
-    for slot in doc:
-        if not isinstance(slot, dict):
-            continue
-        # A slot mid-prefill or mid-decode both count as busy; only a truly
-        # free slot is capacity.
-        if slot.get("is_processing") or slot.get("is_processing_prompt"):
-            busy += 1
-        n_ctx = slot.get("n_ctx")
-        if isinstance(n_ctx, int) and n_ctx > 0:
-            contexts.append(n_ctx)
-    return ((len(doc), busy), (min(contexts) if contexts else None),
-            len(contexts))
+    detail = read_slot_detail(base_url, kind, timeout, key)
+    return detail["slots"], detail["slot_ctx"], detail["slot_ctx_slots"]
 
 
 def _host_of(url):
@@ -508,13 +562,16 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
                 ValueError, KeyError) as exc:
             resident, resident_error = None, "%s: %s" % (type(exc).__name__, exc)
         try:
-            slots, slot_ctx, slot_ctx_slots = read_slot_state(
-                base_url, kind, timeout, key)
+            _detail = read_slot_detail(base_url, kind, timeout, key)
+            slots = _detail["slots"]
+            slot_ctx = _detail["slot_ctx"]
+            slot_ctx_slots = _detail["slot_ctx_slots"]
+            parked = _detail["parked"]
             slots_error = None
         except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                 ValueError, KeyError) as exc:
-            slots, slot_ctx, slot_ctx_slots, slots_error = None, None, None, \
-                "%s: %s" % (type(exc).__name__, exc)
+            slots, slot_ctx, slot_ctx_slots, parked, slots_error = \
+                None, None, None, None, "%s: %s" % (type(exc).__name__, exc)
         return {
             "lane": label,
             "url": base_url,
@@ -540,6 +597,10 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
             # these, so 1 and 4 describe very different servers. None when
             # /slots was never read (a 401, a timeout) -- no read, no count.
             "slot_ctx_slots": slot_ctx_slots,
+            # Slots whose busy flag is clear but which still HOLD a task. The
+            # spare-capacity line used to certify this lane as free capacity
+            # while one slot held an assigned task -- see read_slot_detail.
+            "parked": parked,
             "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
             "error": None,
@@ -580,6 +641,10 @@ def probe(label, base_url, kind, timeout=TIMEOUT, key=None):
             "slots_cause": None,
             "slot_ctx": None,
             "slot_ctx_slots": None,
+            # Carried on the down row too, for the reason slot_ctx_slots is: a
+            # consumer reading row["parked"] must not get a KeyError on exactly
+            # the lanes it most needs to explain.
+            "parked": None,
             "key_source": key_src,
             "latency_ms": round((time.time() - started) * 1000),
             "error": "%s: %s" % (type(exc).__name__, exc),
@@ -686,11 +751,37 @@ def main(argv):
                  if r.get("slots") is not None and r.get("serving")
                  and r["slots"][0] > 0 and r["slots"][1] == 0]
         if spare:
+            # A QUALIFIED certificate. MEASURED 2026-12-04 against the live
+            # fleet: the one lane this line certified was `3090-defiant 0/4`,
+            # while slot 3 held `id_task 158` with 19 prompt tokens ingested and
+            # 0 processed, unchanged over nine reads across ~40 seconds. The
+            # busy flags were true and the word "every slot free" was still an
+            # overstatement, because a slot holding an assigned task is not
+            # evidence of freedom. This is the same defect as the missing
+            # partial line and the n_ctx scope note: a real number reported
+            # without the fact that decides whether it can be used.
+            #
+            # The wording states the reservation and does NOT call the slot
+            # busy. Which of the two it is -- reserved work about to prefill, or
+            # state left behind by a finished task -- cannot be decided from the
+            # /slots document, and picking either would be the same defect
+            # facing the other way. The number and its qualifier travel
+            # together; a lane with no parked slot renders exactly as before.
+            def _park_note(row):
+                parked = row.get("parked")
+                if not parked:
+                    return ""
+                tasks = ", ".join(
+                    "slot %s holds task %s" % (p.get("slot"), p.get("id_task"))
+                    for p in parked)
+                return " [%s -- not counted busy, not counted free]" % tasks
+
             print("[%d] loaded local server(s) with every slot free (MEASURED "
                   "spare capacity: %s)"
                   % (len(spare), ", ".join(
-                      "%s 0/%d%s" % (r["lane"], r["slots"][0],
-                                    _ctx_suffix(r)) for r in spare)))
+                      "%s 0/%d%s%s" % (r["lane"], r["slots"][0],
+                                      _ctx_suffix(r), _park_note(r))
+                      for r in spare)))
         # PARTIAL capacity is capacity too. MEASURED 2026-11-29: a loaded
         # llama.cpp server answering (4, 1) -- three slots free, one busy --
         # matched NO line in this report, because the predicate above demands
